@@ -1,0 +1,1015 @@
+A gear train, tumbling
+======================
+
+Three gears that actually mesh, turning at their true relative speeds, on a plate that rotates in
+three dimensions — drawn by [cairo](https://github.com/sysl-lang/cairo) and shown by
+[sdl3](https://github.com/sysl-lang/sdl3).
+
+**Neither library can do this alone**, which is the whole reason this program needs both. SDL3 has a
+window, an event queue and a clock, and rasterizes nothing but rectangles and textures. Cairo draws
+real vector graphics — gradients, arcs, measured text, antialiasing — and has no idea what a window
+is.
+
+The join is **one buffer of ARGB32 pixels**. That is cairo's native format and one of SDL's texture
+formats, and on a little-endian machine both mean the bytes B, G, R, A. So nothing is converted
+anywhere and there is no per-pixel loop in this program at all:
+
+```
+cairo draws into an image surface -> surface.data() -> texture.update() -> present
+```
+
+The interesting part is the third dimension. Cairo is strictly 2D and its matrix is affine: it
+rotates, scales and shears, and it cannot do perspective. That looks like it settles the question,
+and it does not, for a reason worth the rest of this page.
+
+
+    import sh.sysl.cairo.*
+    import sh.sysl.sdl3.*
+    import sysl.math.{Float, pi}
+    import sysl.slices.as_ptr
+
+    const W: int = 900
+    const H: int = 560
+
+    const WIDTH: real = 900.0
+    const HEIGHT: real = 560.0
+
+Where the assembly sits on screen. The gears are laid out about the origin, because the origin is
+what the plate turns around, and this is where that origin is put.
+
+    const SCREEN_X: real = 450.0
+    const SCREEN_Y: real = 300.0
+
+
+A gear, as a gear catalogue describes one
+-----------------------------------------
+
+Everything about a spur gear follows from two numbers: how many teeth it has, and the **module** $m$,
+which is the size of one tooth. The **pitch circle** is where the geometry lives — the circle on
+which two meshing gears roll against each other without slipping — and its radius is
+
+$$r \;=\; \frac{m N}{2}$$
+
+so a gear with twice the teeth is twice the size, and two gears mesh only if they were cut with the
+same module. That is why the module is a constant here and not a field: a train of gears with
+different modules is not a train, it is three gears near each other.
+
+The teeth stand a distance $m$ above the pitch circle (the **addendum**) and the gaps are cut $1.25m$
+below it (the **dedendum**). The extra quarter is clearance, so the tip of one gear has somewhere to
+go at the bottom of the other's gap.
+
+$$r_a = r + m \qquad r_f = r - 1.25\,m$$
+
+    const MODULE: real = 8.0
+    const ADDENDUM: real = 1.0
+    const DEDENDUM: real = 1.25
+
+How thick a gear is, and how many points one tooth of its outline is sampled at. Both are explained
+where they are used.
+
+    const THICKNESS: real = 26.0
+    const PER_TOOTH: int = 8
+
+One turn divided among the teeth is the **circular pitch** $p = 2\pi / N$, which is one tooth and one
+gap together. Everything about the tooth shape below is written as a fraction of it.
+
+    struct Gear
+        teeth: int
+        cx: real
+        cy: real
+        angle: real
+        hue: real
+
+        pitch_radius(self) -> real = MODULE * real(self.teeth) / 2.0
+
+        tip_radius(self) -> real = self.pitch_radius() + ADDENDUM * MODULE
+        root_radius(self) -> real = self.pitch_radius() - DEDENDUM * MODULE
+
+        pitch_angle(self) -> real = 2.0 * pi / real(self.teeth)
+
+
+Meshing, which is mostly a question about phase
+-----------------------------------------------
+
+Two gears mesh when their pitch circles are tangent, so the distance between their centres is
+
+$$d \;=\; r_1 + r_2 \;=\; \frac{m\,(N_1 + N_2)}{2}$$
+
+and rolling without slipping fixes their speeds: the arc length swept per unit time is equal at the
+contact, so
+
+$$\frac{\omega_2}{\omega_1} \;=\; -\frac{N_1}{N_2}$$
+
+with the sign saying they turn opposite ways. Both of those are easy and neither is where the
+mistakes are.
+
+**The mistake is phase.** Two gears at exactly the right distance turning at exactly the right speeds
+will still have their teeth passing through each other unless one gear's teeth line up with the
+other's gaps, and there is nothing forgiving about it — an error of a few degrees is instantly
+visible and looks like a broken renderer rather than like a physical impossibility.
+
+The condition is this. Let $\beta$ be the direction from the driver's centre to the driven gear's.
+At the moment a **tooth** of the driver points along $\beta$, a **gap** of the driven gear must point
+back along it. Gaps sit half a pitch away from teeth, which is $\pi/N_2$, and pointing back is a
+further $\pi$. Integrating the speed relation from that moment gives the driven gear's angle
+outright:
+
+$$\theta_2 \;=\; -\frac{N_1}{N_2}\,\bigl(\theta_1 - \beta\bigr) \;+\; \beta \;+\; \pi \;+\; \frac{\pi}{N_2}$$
+
+Each term earns its place: the first rolls the gear, the second and third put the reference direction
+back where the line of centres is, and the last is the half-tooth that turns a collision into a mesh.
+
+    mesh(driver: Gear, teeth: int, bearing: real, hue: real) -> Gear
+        val r = MODULE * real(teeth) / 2.0
+        val d = driver.pitch_radius() + r
+        val ratio = real(driver.teeth) / real(teeth)
+        val half_gap = pi / real(teeth)
+
+        Gear(teeth,
+             driver.cx + d * bearing.cos(),
+             driver.cy + d * bearing.sin(),
+             -ratio * (driver.angle - bearing) + bearing + pi + half_gap,
+             hue)
+    end mesh
+
+Everything the drawing depends on lives in one struct, so a frame is a pure function of a `Model` —
+which is what makes the `--shot` picture reproducible, and what would make an export match the
+window if this program had one.
+
+    struct Model
+        angle: real
+        speed: real
+        yaw: real
+        pitch: real
+        tumbling: bool
+        paused: bool
+        n1: int
+        n2: int
+        n3: int
+        hover: int
+        fps: real
+
+The train: the first gear is placed by hand and the other two are placed **by meshing**, so there is
+nowhere for a wrong distance to hide. Change a tooth count and the positions, the speeds and the
+printed ratio all follow.
+
+    train(m: Model) -> (Gear, Gear, Gear)
+        val a = Gear(m.n1, -150.0, 40.0, m.angle, 0.55)
+        val b = mesh(a, m.n2, -0.16, 0.08)
+        val c = mesh(b, m.n3, -pi / 2.6, 0.33)
+
+        (a, b, c)
+    end train
+
+
+The projection, and why an affine matrix is enough
+--------------------------------------------------
+
+Here is the fact the whole program rests on:
+
+> **An orthographic projection of a *flat* object rotated in 3D is an affine map.**
+
+A gear train is flat. So the tumble is not an approximation of a 3D rotation — it *is* one, computed
+exactly, and it fits in the six numbers cairo will accept.
+
+Take a rotation by $\theta$ about the vertical axis (yaw) followed by $\phi$ about the horizontal one
+(pitch):
+
+$$R \;=\; R_x(\phi)\,R_y(\theta) \;=\;
+\begin{pmatrix}
+\cos\theta & 0 & \sin\theta \\
+\sin\phi\sin\theta & \cos\phi & -\sin\phi\cos\theta \\
+-\cos\phi\sin\theta & \sin\phi & \cos\phi\cos\theta
+\end{pmatrix}$$
+
+An orthographic camera keeps the first two rows and throws away the third. Apply it to a point of the
+plane, $(x, y, 0)$, displaced a height $z$ along the plane's normal:
+
+$$\begin{pmatrix} u \\ v \end{pmatrix} =
+\underbrace{\begin{pmatrix} \cos\theta & 0 \\ \sin\phi\sin\theta & \cos\phi \end{pmatrix}}_{\text{linear in } x,\,y}
+\begin{pmatrix} x \\ y \end{pmatrix}
++ z \begin{pmatrix} \sin\theta \\ -\sin\phi\cos\theta \end{pmatrix}
++ \begin{pmatrix} S_x \\ S_y \end{pmatrix}$$
+
+The $z$ term has no $x$ or $y$ in it. **Height above the plane contributes only to the translation** —
+which is why an extrusion layer costs two subtractions here rather than a mesh and a depth buffer,
+and it is the single most useful consequence of the object being flat.
+
+Cairo writes a matrix as $u = xx\,x + xy\,y + x_0$ and $v = yx\,x + yy\,y + y_0$, so the six numbers
+fall out by inspection.
+
+    projection(m: Model, z: real) -> Matrix
+        val ct = m.yaw.cos()
+        val st = m.yaw.sin()
+        val cp = m.pitch.cos()
+        val sp = m.pitch.sin()
+
+        Matrix(ct, sp * st, 0.0, cp, SCREEN_X + z * st, SCREEN_Y - z * sp * ct)
+    end projection
+
+Hand that to cairo and every circle becomes a true ellipse, every tooth its correct projection, and
+every gradient and dash pattern comes along — for free, because that is what a transform means.
+
+A wall of the rim, though, has corners at **two** different heights, and a matrix carries only one.
+So the same projection is also written out longhand.
+
+    project(m: Model, x: real, y: real, z: real) -> (real, real)
+        val ct = m.yaw.cos()
+        val st = m.yaw.sin()
+        val cp = m.pitch.cos()
+        val sp = m.pitch.sin()
+
+        (SCREEN_X + ct * x + z * st, SCREEN_Y + sp * st * x + cp * y - z * sp * ct)
+    end project
+
+The row that was thrown away is not wasted: it is the **depth**, and it is what decides what is in
+front of what.
+
+$$d(\mathbf{n}) \;=\; -\cos\phi\sin\theta\;n_x \;+\; \sin\phi\;n_y \;+\; \cos\phi\cos\theta\;n_z$$
+
+    depth_of(m: Model, nx: real, ny: real, nz: real) -> real =
+        -m.pitch.cos() * m.yaw.sin() * nx + m.pitch.sin() * ny + m.pitch.cos() * m.yaw.cos() * nz
+
+Applied to the plane's own normal $(0,0,1)$ it gives $\cos\phi\cos\theta$ — which is also the
+determinant of the $2\times2$ block above. **The projection is singular exactly when the plate is
+edge-on**, which is the same statement as "a plane seen edge-on has no area", and it is why the
+tumble below is bounded well short of $\pm\pi/2$. Its sign says which face of the gear is the near
+one.
+
+    depth_sense(m: Model) -> real = m.pitch.cos() * m.yaw.cos()
+
+
+Light
+-----
+
+A surface facing the viewer is one thing; a surface that looks solid is another. The shading is plain
+Lambert — brightness is the cosine of the angle between the surface normal and the light,
+
+$$I \;=\; \max\bigl(0,\; \hat{\mathbf{n}}_{\text{cam}} \cdot \boldsymbol{\ell}\bigr)$$
+
+with one decision in it that matters more than the formula: **the light is fixed in camera space, not
+in the world's**. It does not tumble with the assembly. A face that brightens as it turns towards the
+light is the cue that says "this is a solid" far more than the thickness does; a light bolted to the
+object would rotate with it and say nothing at all.
+
+    lambert(m: Model, nx: real, ny: real, nz: real) -> real
+        val ct = m.yaw.cos()
+        val st = m.yaw.sin()
+        val cp = m.pitch.cos()
+        val sp = m.pitch.sin()
+
+        val ex = ct * nx + st * nz
+        val ey = sp * st * nx + cp * ny - sp * ct * nz
+        val ez = depth_of(m, nx, ny, nz)
+
+        val d = ex * -0.42 + ey * -0.60 + ez * -0.68
+
+        if d < 0.0 then 0.0 else d
+    end lambert
+
+
+Some small things
+-----------------
+
+Text is placed by measuring it, which is the only way that does not assume a font.
+
+    centred(cr: Context, text: string, x: real, y: real)
+        var c = cr
+        val e = c.text_extents(text)
+
+        c.move_to(x - e.width / 2.0 - e.x_bearing, y)
+        c.show_text(text)
+    end centred
+
+    right_aligned(cr: Context, text: string, x: real, y: real)
+        var c = cr
+        val e = c.text_extents(text)
+
+        c.move_to(x - e.width - e.x_bearing, y)
+        c.show_text(text)
+    end right_aligned
+
+One decimal place, by arithmetic rather than by a format specifier, so it is exact and needs nothing
+from the standard library that might not be there.
+
+    one_place(v: real) -> string
+        val scaled = int(v * 10.0 + (if v < 0.0 then -0.5 else 0.5))
+        val whole = scaled / 10
+        val tenth = if scaled < 0 then -(scaled % 10) else scaled % 10
+        val sign = if v < 0.0 && whole == 0 then "-" else ""
+
+        f"$sign%s$whole%d.$tenth%d"
+    end one_place
+
+Enough colour space to keep three gears distinguishable however the tooth counts are re-cut.
+
+    hue_rgb(h: real, v: real) -> (real, real, real)
+        val i = int(h * 6.0) % 6
+        val f = h * 6.0 - real(int(h * 6.0))
+        val p = v * 0.35
+        val q = v * (1.0 - 0.65 * f)
+        val t = v * (1.0 - 0.65 * (1.0 - f))
+
+        if i == 0 then (v, t, p)
+        elif i == 1 then (q, v, p)
+        elif i == 2 then (p, v, t)
+        elif i == 3 then (p, q, v)
+        elif i == 4 then (t, p, v)
+        else (v, p, q)
+    end hue_rgb
+
+
+Cutting the teeth
+-----------------
+
+A real tooth flank is an **involute** of the base circle, the curve traced by unwinding a taut string
+from it, and it is chosen because it keeps the contact point moving along a straight line so the
+speed ratio stays exactly constant. Approximating it with a straight flank is a lie, but a small one
+at this size, and it costs a page of arithmetic to fix for no visible gain here.
+
+What does matter is the proportion. A tooth occupies **half the circular pitch** at the pitch circle,
+so the tooth and the gap are equal there — that is exactly what lets any two gears of the same module
+mesh. The tooth is therefore narrower at its tip and wider at its root, and the fractions below say
+so: the tip land runs from $0.34p$ to $0.66p$ and the gap floor from $0.80p$ round to $0.20p$ of the
+next tooth.
+
+**The outline is a polygon rather than a path of arcs**, and that is a decision the *rim* forces:
+every edge of it becomes a wall, and a wall has to know which way it faces, so the vertices are needed
+one at a time. The two lands are short arcs and three points each is already smooth; the flanks are
+straight and need none. Eight points to a tooth.
+
+    outline_points(g: Gear) -> int = g.teeth * PER_TOOTH
+
+    outline_point(g: Gear, k: int) -> (real, real)
+        val fracs = [0.00, 0.10, 0.20, 0.34, 0.50, 0.66, 0.80, 0.90]
+        val tip = [false, false, false, true, true, true, false, false]
+        val n = outline_points(g)
+        val i = ((k % n) + n) % n
+        val j = i % PER_TOOTH
+        val a = g.angle + (real(i / PER_TOOTH) + fracs[j]) * g.pitch_angle()
+        val r = if tip[j] then g.tip_radius() else g.root_radius()
+
+        (g.cx + r * a.cos(), g.cy + r * a.sin())
+    end outline_point
+
+The index wraps, so asking for point $k+1$ at the end of the ring is asking for point $0$, and no
+caller has to think about it.
+
+    tooth_path(cr: Context, g: Gear)
+        var c = cr
+        val n = outline_points(g)
+        val (x0, y0) = outline_point(g, 0)
+
+        c.new_sub_path()
+        c.move_to(x0, y0)
+
+        for k in 1..<n
+            val (x, y) = outline_point(g, k)
+
+            c.line_to(x, y)
+
+        c.close_path()
+    end tooth_path
+
+
+The holes
+---------
+
+A gear of any size is lightened by a ring of holes, and every gear has a bore for its shaft. They are
+**through-holes**, and that is the whole reason they are worth this much trouble: a hole in a solid
+plate is a short cylinder whose inside you can see, and painting a dark disc on the face instead is
+precisely what makes a drawing look like a sticker.
+
+The bore is the last one in the list, so a single loop covers all of them.
+
+    hole_count(g: Gear) -> int
+        val ring = if g.teeth < 14 then 0 elif g.teeth < 22 then 4 else 6
+
+        ring + 1
+    end hole_count
+
+    hole_at(g: Gear, i: int) -> (real, real, real)
+        val ring = hole_count(g) - 1
+        val rr = g.root_radius()
+
+        if i >= ring || ring == 0
+            (g.cx, g.cy, rr * 0.17)
+        else
+            val a = g.angle + real(i) * 2.0 * pi / real(ring)
+
+            (g.cx + rr * 0.62 * a.cos(), g.cy + rr * 0.62 * a.sin(), rr * 0.16)
+    end hole_at
+
+
+The face
+--------
+
+The face is the outline **with the holes taken out of it**, as one compound path filled under the
+even-odd rule. A point is inside the shape when a ray from it crosses the path an odd number of
+times, so a circle drawn inside the outline is a hole rather than a disc, and what was drawn before
+this shows through.
+
+That is the difference between a plate with holes in it and a plate with circles painted on it, and
+it is one call to `set_fill_rule`.
+
+    gear_face(cr: Context, g: Gear, lit: bool, light: real)
+        var c = cr
+        val (r0, g0, b0) = hue_rgb(g.hue, if lit then 1.0 else 0.84)
+        val r = r0 * light
+        val gr = g0 * light
+        val b = b0 * light
+        val rp = g.pitch_radius()
+
+        tooth_path(c, g)
+
+        for i in 0..<hole_count(g)
+            val (hx, hy, rh) = hole_at(g, i)
+
+            c.new_sub_path()
+            c.arc(hx, hy, rh, 0.0, 2.0 * pi)
+
+        var body = radial_pattern(g.cx - rp * 0.45, g.cy - rp * 0.55, rp * 0.05,
+                                  g.cx, g.cy, g.tip_radius() * 1.1)
+
+        body.add_color_stop_rgb(0.0, r * 1.25, gr * 1.25, b * 1.25)
+        body.add_color_stop_rgb(1.0, r * 0.62, gr * 0.62, b * 0.62)
+
+        c.set_fill_rule(FILL_RULE_EVEN_ODD)
+        c.set_source(body)
+        c.fill_preserve()
+        c.set_fill_rule(FILL_RULE_WINDING)
+        body.destroy()
+
+Stroking the same compound path outlines the teeth and every hole at once — the edge where the face
+meets the walls, in one call, because the path is still there after `fill_preserve`.
+
+        c.set_source_rgba(0.0, 0.0, 0.0, 0.45)
+        c.set_line_width(1.0)
+        c.stroke()
+
+The pitch circle, dashed. It is invisible on a real gear and drawing it is what turns the picture
+into a diagram: it is the circle everything above was measured from, and the place where two gears
+touch always lies on both of them.
+
+        val dashes = [3.0, 6.0]
+
+        c.set_dash(dashes[0..<2], 0.0)
+        c.set_source_rgba(1.0, 1.0, 1.0, 0.20)
+        c.arc(g.cx, g.cy, rp, 0.0, 2.0 * pi)
+        c.stroke()
+        c.set_dash(dashes[0..<0], 0.0)
+
+The hub is a ring of material round the bore — an annulus and not a disc, because the bore has to
+stay open or the shaft has nowhere to go. Two circles under the even-odd rule again.
+
+        val (bx, by, br) = hole_at(g, hole_count(g) - 1)
+
+        c.new_sub_path()
+        c.arc(g.cx, g.cy, g.root_radius() * 0.34, 0.0, 2.0 * pi)
+        c.new_sub_path()
+        c.arc(bx, by, br, 0.0, 2.0 * pi)
+        c.set_fill_rule(FILL_RULE_EVEN_ODD)
+        c.set_source_rgba(r * 1.1, gr * 1.1, b * 1.1, 0.55)
+        c.fill()
+        c.set_fill_rule(FILL_RULE_WINDING)
+
+One tooth painted, so the rotation is countable rather than merely apparent. `arc` outwards along the
+tip and `arc_negative` back along the root closes the shape of a single tooth.
+
+        val p = g.pitch_angle()
+
+        c.new_path()
+        c.arc(g.cx, g.cy, g.tip_radius(), g.angle + 0.20 * p, g.angle + 0.80 * p)
+        c.arc_negative(g.cx, g.cy, g.root_radius(), g.angle + 0.80 * p, g.angle + 0.20 * p)
+        c.close_path()
+        c.set_source_rgba(1.0, 1.0, 1.0, 0.22)
+        c.fill()
+    end gear_face
+
+
+The walls
+---------
+
+Here is where the matrix stops being enough. A wall joins the far face to the near one, so it has
+corners at two heights, and it is drawn from projected points directly.
+
+Two things have to be right, and together they are the whole of the hidden-surface problem in this
+program.
+
+**Cull.** The outward normal of a wall is perpendicular to its edge, and there are two candidates;
+which one points outwards depends on the winding, so it is checked against the radius rather than
+assumed. A wall is drawn only when it faces the viewer, $d(\mathbf{n}) < 0$. Exactly half of them
+survive, and that is what lets the near face sit *on* a wall rather than inside a tube.
+
+    rim_wall(cr: Context, m: Model, g: Gear, k: int, r: real, gr: real, b: real, zn: real, zf: real)
+        var c = cr
+        val (ax, ay) = outline_point(g, k)
+        val (bx, by) = outline_point(g, k + 1)
+        val ex = bx - ax
+        val ey = by - ay
+        val len = (ex * ex + ey * ey).sqrt()
+
+        if len > 0.0001
+            var nx = ey / len
+            var ny = -ex / len
+            val mx = (ax + bx) / 2.0 - g.cx
+            val my = (ay + by) / 2.0 - g.cy
+
+            if nx * mx + ny * my < 0.0
+                nx = -nx
+                ny = -ny
+
+            if depth_of(m, nx, ny, 0.0) < 0.0
+                val shade = 0.16 + 0.62 * lambert(m, nx, ny, 0.0)
+                val (p1x, p1y) = project(m, ax, ay, zf)
+                val (p2x, p2y) = project(m, bx, by, zf)
+                val (p3x, p3y) = project(m, bx, by, zn)
+                val (p4x, p4y) = project(m, ax, ay, zn)
+
+                c.move_to(p1x, p1y)
+                c.line_to(p2x, p2y)
+                c.line_to(p3x, p3y)
+                c.line_to(p4x, p4y)
+                c.close_path()
+                c.set_source_rgb(r * shade, gr * shade, b * shade)
+                c.fill()
+    end rim_wall
+
+The inside of a through-hole is the same quad with the normals pointing **inwards**, towards the
+hole's axis. That one sign is the difference between seeing the near side of a tube and the far side
+of it, which is what you actually see looking into a tilted hole.
+
+A circle is convex, so its visible inner walls never overlap each other and none of the ordering
+trouble below arises here. They are darker than the rim because less light reaches down a hole — the
+cheapest approximation of ambient occlusion there is, and at this size it is enough.
+
+    hole_wall(cr: Context, m: Model, hx: real, hy: real, rh: real,
+              r: real, gr: real, b: real, zn: real, zf: real)
+        var c = cr
+        val segs = 18
+
+        for i in 0..<segs
+            val a0 = real(i) * 2.0 * pi / real(segs)
+            val a1 = real(i + 1) * 2.0 * pi / real(segs)
+            val am = (a0 + a1) / 2.0
+            val nx = -am.cos()
+            val ny = -am.sin()
+
+            if depth_of(m, nx, ny, 0.0) < 0.0
+                val shade = 0.07 + 0.42 * lambert(m, nx, ny, 0.0)
+                val ax = hx + rh * a0.cos()
+                val ay = hy + rh * a0.sin()
+                val bx = hx + rh * a1.cos()
+                val by = hy + rh * a1.sin()
+                val (p1x, p1y) = project(m, ax, ay, zf)
+                val (p2x, p2y) = project(m, bx, by, zf)
+                val (p3x, p3y) = project(m, bx, by, zn)
+                val (p4x, p4y) = project(m, ax, ay, zn)
+
+                c.move_to(p1x, p1y)
+                c.line_to(p2x, p2y)
+                c.line_to(p3x, p3y)
+                c.line_to(p4x, p4y)
+                c.close_path()
+                c.set_source_rgb(r * shade, gr * shade, b * shade)
+                c.fill()
+    end hole_wall
+
+
+Order, without sorting anything
+-------------------------------
+
+A gear outline is not convex — teeth stick out — so two visible walls *can* overlap in projection,
+and the one in front has to be painted last. Sorting a few hundred quads every frame would work and
+is not necessary, because of the shape of the depth function.
+
+A point of the outline at polar coordinates $(\rho, \alpha)$ has depth
+
+$$d(\alpha) \;=\; \rho(\alpha)\bigl(-\cos\phi\sin\theta\,\cos\alpha \;+\; \sin\phi\,\sin\alpha\bigr)
+\;=\; \rho(\alpha)\,A\,\cos(\alpha - \alpha_0)$$
+
+with $A = \sqrt{\cos^{2}\phi\,\sin^{2}\theta + \sin^{2}\phi}$. Ignoring the mild wobble in
+$\rho(\alpha)$ between root and tip, that is **one cycle of a cosine**: a single nearest point, a
+single furthest one, and monotone in between.
+
+So the visible half is the arc centred on the nearest wall, and the two **ends** of that arc are the
+far ones. Walking outwards-in from the nearest — the pair at distance $j$, then $j-1$, and so on —
+paints every wall over the one behind it, in $O(n)$ and with no comparisons.
+
+The two ends of that range are the awkward part, and are why this is not one tidy symmetric loop. At
+$j = n/2$ the two sides name the **same** wall, and at $j = 0$ there is only one wall to name. Each of
+those is drawn once and everything between is drawn twice — exactly $n$ walls, none missed and none
+repeated.
+
+Getting that wrong is not subtle. An earlier version of this program walked $j$ from $n/2$ down to
+$1$, so the wall at $j = 0$ — the *nearest* one, in the middle of the visible band — was never drawn
+at all, while $j = n/2$ was drawn twice. The result was one tooth per gear with a hole straight
+through its rim, travelling round the gear as it turned.
+
+    draw_gear(cr: Context, m: Model, g: Gear, lit: bool)
+        var c = cr
+        val (r, gr, b) = hue_rgb(g.hue, if lit then 0.95 else 0.78)
+        val near = if depth_sense(m) > 0.0 then -1.0 else 1.0
+        val zn = near * 0.5 * THICKNESS
+        val zf = -zn
+        val n = outline_points(g)
+
+        c.identity_matrix()
+
+        var nearest = 0
+        var least = 1.0e18
+
+        for k in 0..<n
+            val (ax, ay) = outline_point(g, k)
+            val d = depth_of(m, ax - g.cx, ay - g.cy, 0.0)
+
+            if d < least
+                least = d
+                nearest = k
+
+        val half = n / 2
+
+        for i in 0..<(half + 1)
+            val j = half - i
+
+            rim_wall(c, m, g, nearest + j, r, gr, b, zn, zf)
+
+            if j > 0 && j < half
+                rim_wall(c, m, g, nearest - j, r, gr, b, zn, zf)
+
+The insides of the holes come next, before the face, because the face has them cut out of it and
+these are what shows through.
+
+        for i in 0..<hole_count(g)
+            val (hx, hy, rh) = hole_at(g, i)
+
+            hole_wall(c, m, hx, hy, rh, r, gr, b, zn, zf)
+
+And then the near face, on top of the walls it stands on, lit by the plane's own normal — so the
+whole gear dims as the assembly turns edge-on and brightens as it comes back.
+
+        val face_light = 0.45 + 0.62 * lambert(m, 0.0, 0.0, near)
+
+        c.save()
+        c.set_matrix(projection(m, zn))
+        gear_face(c, g, lit, face_light)
+        c.restore()
+    end draw_gear
+
+The **pitch point** is where two meshing gears touch, at the place on the line of centres that
+divides it in the ratio of the pitch radii. The whole of gear design is arranged so that this point
+stands still while everything turns, which is worth marking.
+
+    pitch_point(cr: Context, m: Model, a: Gear, b: Gear)
+        var c = cr
+        val near = if depth_sense(m) > 0.0 then -1.0 else 1.0
+        val t = a.pitch_radius() / (a.pitch_radius() + b.pitch_radius())
+        val x = a.cx + (b.cx - a.cx) * t
+        val y = a.cy + (b.cy - a.cy) * t
+
+        c.save()
+        c.set_matrix(projection(m, near * 0.5 * THICKNESS))
+        c.arc(x, y, 3.5, 0.0, 2.0 * pi)
+        c.set_source_rgba(1.0, 0.95, 0.75, 0.95)
+        c.fill()
+        c.arc(x, y, 9.0, 0.0, 2.0 * pi)
+        c.set_source_rgba(1.0, 0.95, 0.75, 0.4)
+        c.set_line_width(1.2)
+        c.stroke()
+        c.restore()
+    end pitch_point
+
+
+The frame
+---------
+
+    draw(context_in: Context, m: Model)
+        var cr = context_in
+        val (a, b, c) = train(m)
+
+        var sky = linear_pattern(0.0, 0.0, 0.0, HEIGHT)
+
+        sky.add_color_stop_rgb(0.0, 0.05, 0.06, 0.10)
+        sky.add_color_stop_rgb(1.0, 0.10, 0.12, 0.18)
+
+        cr.set_source(sky)
+        cr.paint()
+        sky.destroy()
+
+The shafts go under everything, so they come out from behind the gears. They are in the plane, so
+they get the plain projection with no height.
+
+        cr.save()
+        cr.set_matrix(projection(m, 0.0))
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.09)
+        cr.set_line_width(2.0)
+        cr.move_to(a.cx, a.cy)
+        cr.line_to(b.cx, b.cy)
+        cr.line_to(c.cx, c.cy)
+        cr.stroke()
+        cr.restore()
+
+The three gears lie in one plane and nothing in a gear train is inside anything else, so ordering
+them by the depth of their centres is the whole of the between-gears hidden-surface problem.
+
+        val sp = m.pitch.sin()
+        val cs = m.pitch.cos() * m.yaw.sin()
+        val da = -cs * a.cx + sp * a.cy
+        val db = -cs * b.cx + sp * b.cy
+        val dc = -cs * c.cx + sp * c.cy
+
+        val order = if da >= db && da >= dc then
+                if db >= dc then [1, 2, 3] else [1, 3, 2]
+            elif db >= da && db >= dc then
+                if da >= dc then [2, 1, 3] else [2, 3, 1]
+            else
+                if da >= db then [3, 1, 2] else [3, 2, 1]
+
+        for i in 0..<3
+            val which = order[i]
+
+            if which == 1
+                draw_gear(cr, m, a, m.hover == 1)
+            elif which == 2
+                draw_gear(cr, m, b, m.hover == 2)
+            else
+                draw_gear(cr, m, c, m.hover == 3)
+
+        pitch_point(cr, m, a, b)
+        pitch_point(cr, m, b, c)
+
+The words stay flat in screen space, so the transform is thrown away first.
+
+        cr.identity_matrix()
+
+        cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_BOLD)
+        cr.set_font_size(24.0)
+        cr.set_source_rgb(0.96, 0.97, 1.0)
+        cr.move_to(48.0, 52.0)
+        cr.show_text("A gear train, tumbling")
+
+        cr.select_font_face("sans", FONT_SLANT_ITALIC, FONT_WEIGHT_NORMAL)
+        cr.set_font_size(12.0)
+        cr.set_source_rgba(0.96, 0.97, 1.0, 0.5)
+        cr.move_to(48.0, 74.0)
+        cr.show_text("cairo cuts the teeth and projects the plane, SDL3 turns the crank and shows the frame")
+
+        cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_NORMAL)
+        cr.set_font_size(11.0)
+        cr.set_source_rgba(0.96, 0.97, 1.0, 0.35)
+
+        val state = if m.paused then "stopped" else f"${one_place(m.fps)}%s fps"
+
+        right_aligned(cr, state, WIDTH - 48.0, 52.0)
+        right_aligned(cr, f"yaw ${one_place(m.yaw * 180.0 / pi)}%s°   pitch ${one_place(m.pitch * 180.0 / pi)}%s°",
+                      WIDTH - 48.0, 70.0)
+
+What the train does is **read off the gears** rather than kept beside them, so the numbers cannot
+disagree with the picture. Note the middle gear does not appear in the ratio at all: an idler reverses
+the direction twice and its tooth count cancels, so it sets the spacing and nothing else.
+
+$$\frac{\omega_3}{\omega_1} \;=\; \left(-\frac{N_1}{N_2}\right)\left(-\frac{N_2}{N_3}\right) \;=\; \frac{N_1}{N_3}$$
+
+        val out_speed = real(a.teeth) / real(c.teeth)
+        val rows = [a, b, c]
+        val names = ["driver", "idler", "output"]
+
+        cr.set_font_size(12.0)
+
+        for i in 0..<3
+            val g = rows[i]
+            val y = HEIGHT - 96.0 + real(i) * 22.0
+            val (rr, gg, bb) = hue_rgb(g.hue, 0.95)
+
+            cr.arc(58.0, y - 4.0, 5.0, 0.0, 2.0 * pi)
+            cr.set_source_rgb(rr, gg, bb)
+            cr.fill()
+
+            cr.set_source_rgba(0.96, 0.97, 1.0, 0.72)
+            cr.move_to(74.0, y)
+            cr.show_text(f"${names[i]}%s — ${g.teeth}%d teeth, pitch radius ${one_place(g.pitch_radius())}%s")
+
+        cr.set_source_rgba(0.96, 0.97, 1.0, 0.5)
+        right_aligned(cr, f"the output turns ${one_place(out_speed)}%s times per turn of the driver",
+                      WIDTH - 48.0, HEIGHT - 96.0)
+        right_aligned(cr, "the idler sets the spacing and not the ratio — it cancels out",
+                      WIDTH - 48.0, HEIGHT - 74.0)
+
+        cr.set_font_size(11.0)
+        cr.set_source_rgba(0.96, 0.97, 1.0, 0.26)
+        cr.move_to(48.0, HEIGHT - 22.0)
+        cr.show_text("space  stop        [ ]  speed        T  hold the tumble        R  re-cut        Q  quit")
+
+        right_aligned(cr, f"sh.sysl.cairo ${version()}%s + sh.sysl.sdl3", WIDTH - 48.0, HEIGHT - 22.0)
+    end draw
+
+
+Pointing at a gear
+------------------
+
+The pointer arrives in screen coordinates and the gears live in the plane. Rather than transforming
+three circles forward — which under a tumble are ellipses, and testing a point against an ellipse is
+work — the pointer is put **backwards through the same matrix**. One inversion, and then the test is
+three distances against three radii, exactly as it would be with no rotation at all.
+
+This is the second dividend of the projection being affine. An affine map is invertible whenever its
+determinant is non-zero, and $\det = \cos\phi\cos\theta$ is the same quantity that says the plate is
+not edge-on. When it is, cairo reports `STATUS_INVALID_MATRIX` and the answer is simply "no gear",
+which is correct: there is nothing to point at.
+
+    over(m: Model, x: real, y: real) -> int
+        var inv = projection(m, 0.0)
+
+        if !inv.invert().ok()
+            return 0
+
+        val (px, py) = inv.transform_point(x, y)
+        val (a, b, c) = train(m)
+        val da = ((px - a.cx) * (px - a.cx) + (py - a.cy) * (py - a.cy)).sqrt()
+        val db = ((px - b.cx) * (px - b.cx) + (py - b.cy) * (py - b.cy)).sqrt()
+        val dc = ((px - c.cx) * (px - c.cx) + (py - c.cy) * (py - c.cy)).sqrt()
+
+        if da < a.tip_radius() then 1
+        elif db < b.tip_radius() then 2
+        elif dc < c.tip_radius() then 3
+        else 0
+    end over
+
+Tooth counts worth looking at, cycled rather than drawn at random: this program has nothing to seed a
+generator with, and a reproducible picture is worth more here than novelty.
+
+    recut(step: int) -> (int, int, int)
+        val sets = [[18, 30, 12], [12, 26, 18], [22, 34, 14], [16, 24, 20], [14, 32, 16]]
+        val s = sets[step % 5]
+
+        (s[0], s[1], s[2])
+    end recut
+
+
+The loop
+--------
+
+`--shot` draws one frame at a fixed angle under SDL's dummy video driver and saves it. Every line of
+the program still runs; only the display and the clock are stood in for, and the picture is the same
+every time because a frame is a pure function of one `Model`.
+
+    main(args: []string) -> Result[unit, string]
+        val offscreen = args.len > 1 && args[1] == "--shot"
+
+        if offscreen
+            set_hint(HINT_VIDEO_DRIVER, "dummy")
+
+        if !init(INIT_VIDEO)
+            return Err(f"SDL would not start: ${error()}%s")
+
+        val opened = create_window("cairo + SDL3 — a gear train", W, H, 0)
+
+        if opened.is_none()
+            return Err(f"the window would not open: ${error()}%s")
+
+        var win = opened.unwrap()
+        val started = win.create_renderer()
+
+        if started.is_none()
+            return Err(f"the renderer would not start: ${error()}%s")
+
+        var r = started.unwrap()
+
+The one buffer both libraries touch. Cairo owns it; SDL only ever reads it.
+
+        var frame = image_surface(FORMAT_ARGB32, W, H)
+
+        if !frame.ok()
+            return Err(f"the drawing surface could not be made: ${frame.status()}%s")
+
+`PIXELFORMAT_ARGB8888` is SDL's name for the same bytes cairo calls `FORMAT_ARGB32` — B, G, R, A on a
+little-endian machine. Nothing is converted between the two; the texture is uploaded straight out of
+cairo's own storage every frame, which is what `TEXTUREACCESS_STREAMING` exists for.
+
+        val made = r.create_texture(PIXELFORMAT_ARGB8888, TEXTUREACCESS_STREAMING, i32(W), i32(H))
+
+        if made.is_none()
+            return Err(f"the texture could not be made: ${error()}%s")
+
+        var tex = made.unwrap()
+
+        r.set_vsync(true)
+
+        var m = Model(0.0, 0.6, 0.0, 0.0, true, false, 18, 30, 12, 0, 60.0)
+        var cut = 0
+        var clock = 0.0
+        var running = true
+        var last = ticks_ns()
+        var frames = 0
+        var fps_at = last
+        var mx = 0.0
+        var my = 0.0
+
+        while running
+            var pending = poll_event()
+
+            while pending.is_some()
+                val e = pending.unwrap()
+                val kind = e.kind
+
+                if kind == EVENT_QUIT
+                    running = false
+                elif kind == EVENT_MOUSE_MOTION
+                    mx = real(e.mouse_x())
+                    my = real(e.mouse_y())
+                    m.hover = over(m, mx, my)
+                elif kind == EVENT_KEY_DOWN
+                    val k = e.key_code()
+
+SDL spells an ordinary key as its own character, so these are ASCII.
+
+                    if k == 113 || k == 27
+                        running = false
+                    elif k == 32
+                        m.paused = !m.paused
+                    elif k == 91
+                        m.speed = m.speed * 0.7
+                    elif k == 93
+                        m.speed = m.speed * 1.4
+                    elif k == 116
+                        m.tumbling = !m.tumbling
+                    elif k == 114
+                        cut += 1
+
+                        val (n1, n2, n3) = recut(cut)
+
+                        m.n1 = n1
+                        m.n2 = n2
+                        m.n3 = n3
+                        m.hover = over(m, mx, my)
+
+                pending = poll_event()
+
+            val now = ticks_ns()
+            var dt = real(now - last) / 1.0e9
+
+            if offscreen then dt = 1.0 / 60.0
+            if dt > 0.25 then dt = 0.25
+
+            last = now
+
+            if !m.paused then m.angle += dt * m.speed
+
+The tumble **swings rather than spins**. Two sines whose periods are incommensurate never come back
+into step, so the assembly keeps presenting an attitude it has not shown before — and staying inside
+these bounds keeps the plate well off edge-on, where $\cos\phi\cos\theta \to 0$, the projection is
+singular, and there would be nothing to see anyway.
+
+            if m.tumbling
+                clock += dt
+
+                m.yaw = 0.85 * (clock * 0.37).sin()
+                m.pitch = 0.55 * (clock * 0.23).sin()
+                m.hover = over(m, mx, my)
+
+            frames += 1
+
+            if now - fps_at > 500_000_000u64
+                m.fps = real(frames) * 1.0e9 / real(now - fps_at)
+                frames = 0
+                fps_at = now
+
+The frame itself, which is the whole of the join between the two libraries: cairo draws, SDL uploads
+and shows.
+
+            var cr = context(frame)
+
+            draw(cr, m)
+            cr.destroy()
+            frame.flush()
+
+            tex.update(as_ptr(frame.data()), i32(frame.stride()))
+            r.clear()
+            r.copy(tex)
+            r.present()
+
+            if offscreen
+                m.angle = 0.42
+                m.yaw = 0.62
+                m.pitch = 0.38
+                m.hover = 2
+
+                var shot = context(frame)
+
+                draw(shot, m)
+                shot.destroy()
+                frame.flush()
+
+                if !frame.write_png("demo.png").ok()
+                    return Err("the screenshot could not be written")
+
+                print("wrote demo.png")
+                running = false
+
+        tex.destroy()
+        r.destroy()
+        win.destroy()
+        frame.destroy()
+        quit()
+        Ok(())
+    end main

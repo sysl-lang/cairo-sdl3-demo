@@ -21,6 +21,21 @@ sysl run . --include-path /opt/homebrew/include --link-path /opt/homebrew/lib
 
 Point at a gear to light it up.
 
+It is a literate program
+------------------------
+
+The source is **`main.lsysl`**, and there is no `.sysl` beside it: the prose *is* the file, with the
+program indented inside it. `sysl build` tangles it and `sysl doc` renders it —
+
+```
+sysl doc . -o gears.md
+```
+
+— re-fencing each indented block as ` ```sysl ` so a highlighter can read it, and passing the prose
+through untouched, math and all. The projection is derived there properly rather than asserted in a
+comment, which is the reason this program is written that way and the flat chart of an earlier draft
+was not.
+
 Why it takes two packages
 -------------------------
 
