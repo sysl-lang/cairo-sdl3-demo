@@ -11,7 +11,7 @@ brew install cairo sdl3
 sysl run . --include-path /opt/homebrew/include --link-path /opt/homebrew/lib
 ```
 
-| | |
+| key | what it does |
 |---|---|
 | `space` | stop the gears |
 | `[` `]` | slower, faster |
