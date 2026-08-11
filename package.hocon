@@ -1,0 +1,21 @@
+// The demo that needs both packages — cairo draws the frame, SDL3 shows it.
+//
+// Neither library can do this alone: SDL3 has a window, an event queue and a clock but rasterizes
+// nothing but rectangles and textures; cairo draws real vector graphics and has no idea what a
+// window is. The join is one buffer of ARGB32 pixels, which is cairo's native format and one of
+// SDL's texture formats, so no conversion happens anywhere.
+
+package {
+  name    = "cairo-sdl3-demo"
+  version = "0.1.0"
+}
+
+dependencies {
+  cairo { git = "github.com/sysl-lang/cairo", version = "0.1.0" }
+  sdl3 { git = "github.com/sysl-lang/sdl3", version = "0.1.2" }
+}
+
+requires {
+  os    = true
+  alloc = true
+}

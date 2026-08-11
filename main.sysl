@@ -1,0 +1,474 @@
+// A live chart you can print — cairo draws every frame, SDL3 shows it, and the same drawing code
+// writes a PDF at the press of a key.
+//
+// **Neither library can do this alone**, which is the reason this demo exists rather than being a
+// third one for whichever package. SDL3 has a window, an event queue and a clock, and rasterizes
+// nothing but rectangles and textures. Cairo draws real vector graphics — gradients, Béziers,
+// measured text, antialiasing — and has no idea what a window is.
+//
+// The join is **one buffer of ARGB32 pixels**, which is cairo's native format and one of SDL's
+// texture formats, so nothing is converted anywhere:
+//
+//     cairo draws into an image surface  ->  surface.data()  ->  texture.update()  ->  present
+//
+// And because `draw` takes a context rather than a window, the **same function** that fills the
+// window sixty times a second also draws onto a PDF surface. Press `S` and the frame you are
+// looking at lands on disk as vector art with selectable text in it — which is a thing a chart in a
+// canvas element cannot do, and the honest argument for building one this way.
+//
+//     sysl run . --include-path /opt/homebrew/include --link-path /opt/homebrew/lib
+//
+//     S      write the current frame to frame.pdf and frame.svg
+//     space  pause
+//     R      re-seed the wave
+//     Q      quit
+//
+// Move the mouse across the chart to read a value off it.
+
+import sh.sysl.cairo.*
+import sh.sysl.sdl3.*
+import sysl.math.{Float, pi}
+import sysl.slices.as_ptr
+
+const W: int = 900
+const H: int = 560
+
+const WIDTH: real = 900.0
+const HEIGHT: real = 560.0
+
+// The plot area of the line chart.
+const PLOT_L: real = 60.0
+const PLOT_R: real = 860.0
+const PLOT_T: real = 110.0
+const PLOT_B: real = 330.0
+
+// Where the bars live, underneath it.
+const BAR_T: real = 400.0
+const BAR_B: real = 500.0
+
+// How many points the curve is sampled at. Every one becomes a line segment, and at this width that
+// is about one segment every four pixels — smooth enough that the antialiasing does the rest.
+const POINTS: int = 200
+
+// Everything the drawing depends on. A frame is a pure function of one of these, which is what makes
+// the exported PDF match the window exactly rather than approximately.
+struct Model
+    t: real
+    seed: real
+    hover_x: real
+    hover: bool
+    fps: real
+    paused: bool
+
+// The signal being plotted: three sines that do not share a period, so it never quite repeats.
+signal(x: real, m: Model) -> real
+    val a = (x * 2.4 + m.t * 0.9 + m.seed).sin()
+    val b = (x * 5.1 - m.t * 1.4 + m.seed * 2.0).sin() * 0.45
+    val c = (x * 11.3 + m.t * 2.1).sin() * 0.18
+
+    (a + b + c) / 1.63
+end signal
+
+// Where a fraction along the plot lands on screen.
+plot_x(u: real) -> real = PLOT_L + u * (PLOT_R - PLOT_L)
+plot_y(v: real) -> real = (PLOT_T + PLOT_B) / 2.0 - v * (PLOT_B - PLOT_T) / 2.0
+
+// Put `text` down with its centre at `x`.
+centred(cr: Context, text: string, x: real, y: real)
+    var c = cr
+    val e = c.text_extents(text)
+
+    c.move_to(x - e.width / 2.0 - e.x_bearing, y)
+    c.show_text(text)
+end centred
+
+right_aligned(cr: Context, text: string, x: real, y: real)
+    var c = cr
+    val e = c.text_extents(text)
+
+    c.move_to(x - e.width - e.x_bearing, y)
+    c.show_text(text)
+end right_aligned
+
+// A rectangle whose corners are rounded by `r`, added to the current path.
+rounded_rect(cr: Context, x: real, y: real, w: real, h: real, r: real)
+    var c = cr
+    val half = pi / 2.0
+
+    c.new_sub_path()
+    c.arc(x + w - r, y + r, r, -half, 0.0)
+    c.arc(x + w - r, y + h - r, r, 0.0, half)
+    c.arc(x + r, y + h - r, r, half, pi)
+    c.arc(x + r, y + r, r, pi, 3.0 * half)
+    c.close_path()
+end rounded_rect
+
+// One value as a string with a single decimal place, since a format specifier for that is not
+// something to assume — this is arithmetic and it is exact.
+one_place(v: real) -> string
+    val scaled = int(v * 10.0 + (if v < 0.0 then -0.5 else 0.5))
+    val whole = scaled / 10
+    val tenth = if scaled < 0 then -(scaled % 10) else scaled % 10
+    val sign = if v < 0.0 && whole == 0 then "-" else ""
+
+    f"$sign%s$whole%d.$tenth%d"
+end one_place
+
+// ## The frame
+//
+// Written once, called by the window loop and by the PDF exporter alike. It never asks which it is.
+draw(context_in: Context, m: Model)
+    var cr = context_in
+
+    // ---- background ----
+
+    var sky = linear_pattern(0.0, 0.0, 0.0, HEIGHT)
+
+    sky.add_color_stop_rgb(0.0, 0.07, 0.09, 0.15)
+    sky.add_color_stop_rgb(1.0, 0.13, 0.16, 0.25)
+
+    cr.set_source(sky)
+    cr.paint()
+    sky.destroy()
+
+    // ---- the header ----
+
+    cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_BOLD)
+    cr.set_font_size(24.0)
+    cr.set_source_rgb(0.96, 0.97, 1.0)
+    cr.move_to(PLOT_L, 52.0)
+    cr.show_text("A live chart you can print")
+
+    cr.select_font_face("sans", FONT_SLANT_ITALIC, FONT_WEIGHT_NORMAL)
+    cr.set_font_size(12.0)
+    cr.set_source_rgba(0.96, 0.97, 1.0, 0.55)
+    cr.move_to(PLOT_L, 74.0)
+    cr.show_text("cairo draws the frame, SDL3 shows it — press S and this same drawing becomes a PDF")
+
+    // The readouts in the top right, which are the only things on the page that are about the
+    // program rather than about the data.
+    cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_NORMAL)
+    cr.set_font_size(11.0)
+    cr.set_source_rgba(0.96, 0.97, 1.0, 0.4)
+
+    val state = if m.paused then "paused" else f"${one_place(m.fps)}%s fps"
+
+    right_aligned(cr, state, PLOT_R, 52.0)
+    right_aligned(cr, f"t = ${one_place(m.t)}%s s", PLOT_R, 70.0)
+
+    // ---- the plot's gridlines ----
+
+    val dashes = [3.0, 4.0]
+
+    cr.set_dash(dashes[0..<2], 0.0)
+    cr.set_line_width(1.0)
+    cr.set_font_size(10.0)
+
+    for i in 0..<5
+        val v = 1.0 - real(i) * 0.5
+        val y = plot_y(v)
+
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.12)
+        cr.move_to(PLOT_L, y)
+        cr.line_to(PLOT_R, y)
+        cr.stroke()
+
+        cr.set_source_rgba(0.96, 0.97, 1.0, 0.35)
+        right_aligned(cr, one_place(v), PLOT_L - 8.0, y + 3.5)
+
+    cr.set_dash(dashes[0..<0], 0.0)
+
+    // ---- the curve, and the area under it ----
+    //
+    // The path is built once and used twice: filled with a gradient by `fill_preserve`, which keeps
+    // it, and then stroked. Describing it a second time would be the obvious mistake.
+
+    cr.move_to(plot_x(0.0), plot_y(signal(0.0, m)))
+
+    for i in 1..<POINTS
+        val u = real(i) / real(POINTS - 1)
+
+        cr.line_to(plot_x(u), plot_y(signal(u, m)))
+
+    cr.line_to(PLOT_R, PLOT_B)
+    cr.line_to(PLOT_L, PLOT_B)
+    cr.close_path()
+
+    var under = linear_pattern(0.0, PLOT_T, 0.0, PLOT_B)
+
+    under.add_color_stop_rgba(0.0, 0.35, 0.78, 0.98, 0.45)
+    under.add_color_stop_rgba(1.0, 0.35, 0.78, 0.98, 0.02)
+
+    cr.set_source(under)
+    cr.fill()
+    under.destroy()
+
+    cr.move_to(plot_x(0.0), plot_y(signal(0.0, m)))
+
+    for i in 1..<POINTS
+        val u = real(i) / real(POINTS - 1)
+
+        cr.line_to(plot_x(u), plot_y(signal(u, m)))
+
+    cr.set_source_rgb(0.45, 0.84, 1.0)
+    cr.set_line_width(2.0)
+    cr.set_line_join(LINE_JOIN_ROUND)
+    cr.set_line_cap(LINE_CAP_ROUND)
+    cr.stroke()
+
+    // ---- the bars ----
+
+    val labels = ["read", "write", "parse", "emit", "link", "run"]
+    val n = labels.len
+    val slot = (PLOT_R - PLOT_L) / real(n)
+    val bar = slot * 0.52
+
+    cr.set_font_size(11.0)
+
+    for i in 0..<n
+        val phase = real(i) * 0.9
+        val v = 0.55 + 0.4 * (m.t * (0.7 + real(i) * 0.13) + phase + m.seed).sin()
+        val h = v * (BAR_B - BAR_T)
+        val x = PLOT_L + real(i) * slot + (slot - bar) / 2.0
+        val y = BAR_B - h
+
+        var g = linear_pattern(0.0, y, 0.0, BAR_B)
+
+        g.add_color_stop_rgb(0.0, 0.99, 0.72, 0.36)
+        g.add_color_stop_rgb(1.0, 0.86, 0.36, 0.32)
+
+        rounded_rect(cr, x, y, bar, h, 4.0)
+        cr.set_source(g)
+        cr.fill()
+        g.destroy()
+
+        cr.set_source_rgba(0.96, 0.97, 1.0, 0.75)
+        centred(cr, labels[i], x + bar / 2.0, BAR_B + 18.0)
+
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.3)
+    cr.set_line_width(1.5)
+    cr.move_to(PLOT_L, BAR_B)
+    cr.line_to(PLOT_R, BAR_B)
+    cr.stroke()
+
+    // ---- the cursor ----
+    //
+    // Only drawn when the mouse is over the plot, and the value it reports is read out of the same
+    // `signal` the curve was drawn from rather than off the pixels — so the readout is exact and
+    // survives into the PDF.
+
+    if m.hover
+        val u = (m.hover_x - PLOT_L) / (PLOT_R - PLOT_L)
+        val v = signal(u, m)
+        val x = plot_x(u)
+        val y = plot_y(v)
+
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.28)
+        cr.set_line_width(1.0)
+        cr.move_to(x, PLOT_T - 10.0)
+        cr.line_to(x, PLOT_B)
+        cr.stroke()
+
+        cr.arc(x, y, 4.5, 0.0, 2.0 * pi)
+        cr.set_source_rgb(1.0, 1.0, 1.0)
+        cr.fill()
+
+        // A label that stays on the page: it flips to the left of the cursor near the right edge.
+        val text = one_place(v)
+
+        cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_BOLD)
+        cr.set_font_size(13.0)
+
+        val e = cr.text_extents(text)
+        val bw = e.width + 18.0
+        val bx = if x + bw + 12.0 > PLOT_R then x - bw - 12.0 else x + 12.0
+
+        rounded_rect(cr, bx, y - 15.0, bw, 26.0, 6.0)
+        cr.set_source_rgba(0.06, 0.08, 0.13, 0.92)
+        cr.fill_preserve()
+        cr.set_source_rgba(0.45, 0.84, 1.0, 0.7)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        cr.set_source_rgb(0.96, 0.97, 1.0)
+        centred(cr, text, bx + bw / 2.0, y + 3.5)
+
+    // ---- the footer ----
+
+    cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_NORMAL)
+    cr.set_font_size(11.0)
+    cr.set_source_rgba(0.96, 0.97, 1.0, 0.3)
+    cr.move_to(PLOT_L, HEIGHT - 22.0)
+    cr.show_text("S  save a PDF and an SVG of this frame        space  pause        R  re-seed        Q  quit")
+
+    right_aligned(cr, f"sh.sysl.cairo ${version()}%s + sh.sysl.sdl3", PLOT_R, HEIGHT - 22.0)
+end draw
+
+// Draw the current frame onto a vector surface. This is the whole of the export: a different
+// surface, the same `draw`, and the model it is given is the one the window is showing.
+export(m: Model) -> Result[unit, string]
+    var pdf = pdf_surface("frame.pdf", WIDTH, HEIGHT)
+
+    if !pdf.ok()
+        return Err(f"the PDF surface could not be made: ${pdf.status()}%s")
+
+    pdf_set_metadata(pdf, PDF_METADATA_TITLE, "a frame of a live chart")
+    pdf_set_metadata(pdf, PDF_METADATA_CREATOR, "sh.sysl.cairo + sh.sysl.sdl3")
+
+    var pcr = context(pdf)
+
+    draw(pcr, m)
+    pcr.destroy()
+    pdf.finish()
+    pdf.destroy()
+
+    var svg = svg_surface("frame.svg", WIDTH, HEIGHT)
+
+    if !svg.ok()
+        return Err(f"the SVG surface could not be made: ${svg.status()}%s")
+
+    var scr = context(svg)
+
+    draw(scr, m)
+    scr.destroy()
+    svg.finish()
+    svg.destroy()
+
+    Ok(())
+end export
+
+main(args: []string) -> Result[unit, string]
+    // With `--shot`, the demo draws one frame at a fixed time under SDL's dummy video driver and
+    // saves it, so the picture in the README is one the program made and can make again. Everything
+    // below this line still runs; only the display and the clock are stood in for.
+    val offscreen = args.len > 1 && args[1] == "--shot"
+
+    if offscreen
+        set_hint(HINT_VIDEO_DRIVER, "dummy")
+
+    if !init(INIT_VIDEO)
+        return Err(f"SDL would not start: ${error()}%s")
+
+    val opened = create_window("cairo + SDL3", W, H, 0)
+
+    if opened.is_none()
+        return Err(f"the window would not open: ${error()}%s")
+
+    var win = opened.unwrap()
+    val started = win.create_renderer()
+
+    if started.is_none()
+        return Err(f"the renderer would not start: ${error()}%s")
+
+    var r = started.unwrap()
+
+    // The one buffer both libraries touch. Cairo owns it; SDL only ever reads it.
+    var frame = image_surface(FORMAT_ARGB32, W, H)
+
+    if !frame.ok()
+        return Err(f"the drawing surface could not be made: ${frame.status()}%s")
+
+    // ARGB8888 is SDL's name for the same bytes cairo calls ARGB32 — B, G, R, A on a little-endian
+    // machine. Nothing is converted between the two; the texture is uploaded straight from cairo's
+    // own storage every frame, which is what `TEXTUREACCESS_STREAMING` is for.
+    val made = r.create_texture(PIXELFORMAT_ARGB8888, TEXTUREACCESS_STREAMING, i32(W), i32(H))
+
+    if made.is_none()
+        return Err(f"the texture could not be made: ${error()}%s")
+
+    var tex = made.unwrap()
+
+    r.set_vsync(true)
+
+    var m = Model(0.0, 0.0, 0.0, false, 60.0, false)
+    var running = true
+    var last = ticks_ns()
+    var frames = 0
+    var fps_at = last
+
+    while running
+        var pending = poll_event()
+
+        while pending.is_some()
+            val e = pending.unwrap()
+            val kind = e.kind
+
+            if kind == EVENT_QUIT
+                running = false
+            elif kind == EVENT_MOUSE_MOTION
+                val x = real(e.mouse_x())
+
+                m.hover = x >= PLOT_L && x <= PLOT_R
+                m.hover_x = x
+            elif kind == EVENT_KEY_DOWN
+                val k = e.key_code()
+
+                // SDL spells an ordinary key as its own character, so these are ASCII.
+                if k == 113 || k == 27
+                    running = false
+                elif k == 32
+                    m.paused = !m.paused
+                elif k == 114
+                    m.seed += 1.7
+                elif k == 115
+                    export(m)?
+                    print("wrote frame.pdf and frame.svg")
+
+            pending = poll_event()
+
+        val now = ticks_ns()
+        var dt = real(now - last) / 1.0e9
+
+        if offscreen then dt = 1.0 / 60.0
+        if dt > 0.25 then dt = 0.25
+
+        last = now
+
+        if !m.paused then m.t += dt
+
+        frames += 1
+
+        if now - fps_at > 500_000_000u64
+            m.fps = real(frames) * 1.0e9 / real(now - fps_at)
+            frames = 0
+            fps_at = now
+
+        // The frame itself: cairo draws, SDL uploads and shows.
+        var cr = context(frame)
+
+        draw(cr, m)
+        cr.destroy()
+        frame.flush()
+
+        tex.update(as_ptr(frame.data()), i32(frame.stride()))
+        r.clear()
+        r.copy(tex)
+        r.present()
+
+        if offscreen
+            m.t = 2.35
+            m.hover = true
+            m.hover_x = 640.0
+
+            // One more pass, so the picture is of the model the README describes rather than of
+            // whatever the first frame happened to be.
+            var shot = context(frame)
+
+            draw(shot, m)
+            shot.destroy()
+            frame.flush()
+
+            if !frame.write_png("demo.png").ok()
+                return Err("the screenshot could not be written")
+
+            export(m)?
+            print("wrote demo.png, frame.pdf and frame.svg")
+            running = false
+
+    tex.destroy()
+    r.destroy()
+    win.destroy()
+    frame.destroy()
+    quit()
+    Ok(())
+end main
