@@ -1,9 +1,8 @@
 cairo-sdl3-demo
 ===============
 
-A live chart you can print — [**cairo**](https://github.com/sysl-lang/cairo) draws every frame,
-[**sdl3**](https://github.com/sysl-lang/sdl3) shows it, and the same drawing code writes a PDF at the
-press of a key.
+A gear train tumbling in space — [**cairo**](https://github.com/sysl-lang/cairo) cuts the teeth,
+[**sdl3**](https://github.com/sysl-lang/sdl3) turns the crank.
 
 ![the demo](demo.png)
 
@@ -14,20 +13,20 @@ sysl run . --include-path /opt/homebrew/include --link-path /opt/homebrew/lib
 
 | | |
 |---|---|
-| `S` | write the current frame to `frame.pdf` and `frame.svg` |
-| `space` | pause |
-| `R` | re-seed the wave |
+| `space` | stop the gears |
+| `[` `]` | slower, faster |
+| `T` | hold the tumble |
+| `R` | re-cut the gears with different tooth counts |
 | `Q` | quit |
 
-Move the mouse across the chart to read a value off it.
+Point at a gear to light it up.
 
 Why it takes two packages
 -------------------------
 
-**Neither library can do this alone**, which is the whole reason this is its own demo rather than a
-third one for either package. SDL3 has a window, an event queue and a clock, and rasterizes nothing
-but rectangles and textures. Cairo draws real vector graphics — gradients, Béziers, measured text,
-antialiasing — and has no idea what a window is.
+**Neither library can do this alone.** SDL3 has a window, an event queue and a clock, and rasterizes
+nothing but rectangles and textures. Cairo draws real vector graphics — gradients, arcs, measured
+text, antialiasing — and has no idea what a window is.
 
 The join is **one buffer of ARGB32 pixels**. That is cairo's native format and one of SDL's texture
 formats, and on a little-endian machine both mean the bytes B, G, R, A — so nothing is converted
@@ -41,43 +40,74 @@ r.copy(tex)
 r.present()
 ```
 
-The point: the window and the PDF are the same function
--------------------------------------------------------
+The 3D is real, not faked
+-------------------------
 
-`draw` takes a `Context`, not a window. It never asks what is underneath it. The loop hands it a
-context over an image surface sixty times a second; pressing `S` hands the *same* function a context
-over a PDF surface, with the *same* model:
+Cairo is strictly 2D and its `Matrix` is affine: it rotates, scales and shears, and it cannot do
+perspective. That sounds like it rules out a tumbling assembly, and it does not, because of one fact:
+
+> **An orthographic projection of a *flat* object rotated in 3D is an affine map.**
+
+A gear train is flat. So the tumble is not an approximation of a 3D rotation — it *is* one, computed
+exactly and handed to cairo as six numbers. Cairo then foreshortens every circle into a true ellipse
+and every tooth into its correct projection, for free, because that is what a transform means.
 
 ```sysl
-var pdf = pdf_surface("frame.pdf", WIDTH, HEIGHT)
-var pcr = context(pdf)
+projection(m: Model, z: real) -> Matrix
+    val ct = m.yaw.cos()
+    val st = m.yaw.sin()
+    val cp = m.pitch.cos()
+    val sp = m.pitch.sin()
 
-draw(pcr, m)
+    Matrix(ct, sp * st, 0.0, cp, SCREEN_X + z * st, SCREEN_Y - z * sp * ct)
 ```
 
-So the file you get is not a screenshot. It is vector art at any zoom, with selectable text and real
-curves in it — of exactly the frame you were looking at. `demo.png` above and `frame.pdf` beside it
-came out of one run and are the same picture.
+The same inverse maps the mouse back into the gears' own plane, so pointing at a gear works under any
+tumble — one matrix inversion rather than three transformed circles.
 
-A chart in a canvas element cannot do that, and it is the honest reason to build one this way.
+The thickness
+-------------
 
-**Everything the drawing depends on is in one `Model` struct**, which is what makes that true rather
-than nearly true. A frame is a pure function of a `Model`, so the export cannot drift from the
-window: it is not re-derived, it is re-drawn. The hover readout is computed from the same `signal`
-the curve was plotted from — never sampled off the pixels — so it survives into the PDF exact.
+The rim is the part a matrix cannot do, because a wall has corners at two different heights. So the
+outline is built as a **polygon** — eight points to a tooth, three on each land and the flanks
+straight — and every edge of it becomes a quad standing on the plane's normal.
 
-What it exercises
------------------
+Two things then have to be got right, and they are the difference between a solid and a mess:
 
-- **cairo** — linear gradients for the background, the area fill and every bar; a rounded rectangle
-  built from four arcs; dashed gridlines set and unset; text measured with `text_extents` and then
-  centred or right-aligned on the measurement; a path built once and used twice with `fill_preserve`
-- **sdl3** — a window, a streaming texture, vsync, the event queue for keys and mouse motion, and
-  `ticks_ns` for the frame clock and the fps counter
+- **Back-face culling.** A wall whose outward normal points away from the viewer is never drawn.
+  Exactly half of them go, which is what lets the near face sit on top of a wall rather than inside a
+  tube.
+- **Order.** Depth around the outline is one cycle of a sinusoid, so the visible half is the arc
+  centred on the nearest wall and its two *ends* are the far ones. Painting outwards-in from the
+  nearest — the pair at distance `j`, then `j - 1`, and so on — puts every wall over the one behind
+  it **without sorting anything**.
 
-It costs about 15% of one core at 60 fps on an M-series Mac, which is cairo software-rasterizing
-900×560 every frame. **RSS is flat** — roughly ten thousand cairo objects are created and destroyed
-per thousand frames, and a missing `destroy` would show up as a climb within seconds.
+Each surviving wall is lit by its own normal, and so is the face. The light is fixed in *camera*
+space rather than in the world's, so it does not tumble with the assembly: a face turning towards the
+light brightens as it comes round, which is the cue that says "solid" more than the thickness itself
+does.
+
+The gears actually mesh
+-----------------------
+
+The first gear is placed by hand; the other two are placed by meshing, so there is nowhere for a
+wrong distance to hide. Centres are `r1 + r2` apart, the driven gear turns the other way and slower
+by the ratio of the tooth counts — and at the moment a tooth of the driver points along the line of
+centres, a *gap* of the driven gear has to point back along it. That last half-tooth offset is the
+one that decides whether the picture is of a machine or of two gears whose teeth pass through each
+other.
+
+The dashed pitch circles and the marked contact points are drawn because they are what the geometry
+is actually about, and are invisible on a real gear. `R` re-cuts the train with different tooth
+counts and everything follows: positions, speeds, the printed ratio.
+
+Cost
+----
+
+About 40% of one core at 60 fps on an M-series Mac — roughly 400 shaded rim quads plus three faces
+per frame, all software-rasterized by cairo. **RSS holds steady**, drifting a few MB either way
+around 100 MB rather than climbing: every cairo object here is destroyed by hand, and a missing
+`destroy` in a frame loop shows up as a one-way climb within seconds.
 
 `--shot`
 --------
@@ -86,15 +116,15 @@ per thousand frames, and a missing `destroy` would show up as a climb within sec
 sysl run . -- --shot
 ```
 
-Draws one frame at a fixed `t` under SDL's dummy video driver and writes `demo.png`, `frame.pdf` and
-`frame.svg`. Every line of the program still runs — only the display and the clock are stood in for
-— so the picture in this README is one the program made and can make again.
+Draws one frame at a fixed angle under SDL's dummy video driver and writes `demo.png`. Every line of
+the program still runs — only the display and the clock are stood in for — and the picture is the
+same every time, because a frame is a pure function of one `Model`.
 
 No files
 --------
 
-No font, no image, no data file. The signal is three sines, the typeface is whatever the system calls
-`"sans"`, and the only files touched are the three it writes.
+No font, no image, no data file. The gears are arithmetic, the typeface is whatever the system calls
+`"sans"`, and the only file touched is the screenshot.
 
 License
 -------

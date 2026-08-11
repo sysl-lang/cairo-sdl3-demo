@@ -1,29 +1,39 @@
-// A live chart you can print — cairo draws every frame, SDL3 shows it, and the same drawing code
-// writes a PDF at the press of a key.
+// A gear train tumbling in space — cairo cuts the teeth, SDL3 turns the crank.
 //
-// **Neither library can do this alone**, which is the reason this demo exists rather than being a
-// third one for whichever package. SDL3 has a window, an event queue and a clock, and rasterizes
-// nothing but rectangles and textures. Cairo draws real vector graphics — gradients, Béziers,
-// measured text, antialiasing — and has no idea what a window is.
+// **Neither library can do this alone**, which is the whole reason this demo needs both. SDL3 has a
+// window, an event queue and a clock, and rasterizes nothing but rectangles and textures. Cairo
+// draws real vector graphics — gradients, arcs, measured text, antialiasing — and has no idea what a
+// window is.
 //
 // The join is **one buffer of ARGB32 pixels**, which is cairo's native format and one of SDL's
-// texture formats, so nothing is converted anywhere:
+// texture formats, so nothing is converted anywhere and there is no per-pixel loop in this program:
 //
 //     cairo draws into an image surface  ->  surface.data()  ->  texture.update()  ->  present
 //
-// And because `draw` takes a context rather than a window, the **same function** that fills the
-// window sixty times a second also draws onto a PDF surface. Press `S` and the frame you are
-// looking at lands on disk as vector art with selectable text in it — which is a thing a chart in a
-// canvas element cannot do, and the honest argument for building one this way.
+// ## The 3D is real, not faked
+//
+// Cairo is a strictly 2D library and its `Matrix` is affine — it can rotate, scale and shear, and it
+// cannot do perspective. That sounds like it rules this out, and it does not, because of one fact:
+//
+// **an orthographic projection of a FLAT object rotated in 3D is an affine map.** A gear train is
+// flat. So the tumble is not an approximation of a 3D rotation — it is one, computed exactly, and
+// handed to cairo as six numbers. Cairo then foreshortens every circle into a true ellipse and every
+// tooth into its correct projection, for free, because that is what a transform means.
+//
+// The thickness is drawn by sweeping the same outline through the depth of the gear a layer at a
+// time, darkening as it goes. Displacing a point along the plane's normal moves its projection by a
+// constant vector, so each layer is the same matrix with a different translation — which is why this
+// costs one subtraction per layer rather than a mesh and a z-buffer.
 //
 //     sysl run . --include-path /opt/homebrew/include --link-path /opt/homebrew/lib
 //
-//     S      write the current frame to frame.pdf and frame.svg
-//     space  pause
-//     R      re-seed the wave
+//     space  stop the crank
+//     [ ]    slower, faster
+//     T      stop the tumble
+//     R      re-cut the gears with different tooth counts
 //     Q      quit
 //
-// Move the mouse across the chart to read a value off it.
+// Point at a gear to read it — the pointer is mapped back through the inverse of the same matrix.
 
 import sh.sysl.cairo.*
 import sh.sysl.sdl3.*
@@ -36,42 +46,163 @@ const H: int = 560
 const WIDTH: real = 900.0
 const HEIGHT: real = 560.0
 
-// The plot area of the line chart.
-const PLOT_L: real = 60.0
-const PLOT_R: real = 860.0
-const PLOT_T: real = 110.0
-const PLOT_B: real = 330.0
+// Where the assembly sits on screen.
+const SCREEN_X: real = 450.0
+const SCREEN_Y: real = 300.0
 
-// Where the bars live, underneath it.
-const BAR_T: real = 400.0
-const BAR_B: real = 500.0
+// The module: the size of a tooth, in the sense a gear catalogue means it. A gear's pitch radius is
+// `MODULE * teeth / 2`, so this is the one number that has to agree across a train — two gears mesh
+// only if they were cut with the same module, which is why it is a constant and not a field.
+const MODULE: real = 8.0
 
-// How many points the curve is sampled at. Every one becomes a line segment, and at this width that
-// is about one segment every four pixels — smooth enough that the antialiasing does the rest.
-const POINTS: int = 200
+// How far up the flank the addendum reaches and how far down the dedendum cuts, as multiples of the
+// module. These are the standard proportions; the dedendum is deeper so the tip of the other gear
+// has somewhere to go.
+const ADDENDUM: real = 1.0
+const DEDENDUM: real = 1.25
 
-// Everything the drawing depends on. A frame is a pure function of one of these, which is what makes
-// the exported PDF match the window exactly rather than approximately.
+// How thick a gear is.
+const THICKNESS: real = 26.0
+
+// How many points one tooth of the outline is sampled at. The lands are short arcs, so three points
+// each is already smooth; the flanks are straight and need none. Eight is the whole tooth.
+const PER_TOOTH: int = 8
+
+// One gear. Everything else about it — where its teeth are, how fast it turns — follows from the
+// tooth count and from what it meshes with.
+struct Gear
+    teeth: int
+    cx: real
+    cy: real
+    angle: real
+    hue: real
+
+    // The circle where two meshing gears roll on each other without slipping. All the geometry is
+    // measured from it: the teeth stand `ADDENDUM` above it and the gaps cut `DEDENDUM` below.
+    pitch_radius(self) -> real = MODULE * real(self.teeth) / 2.0
+
+    tip_radius(self) -> real = self.pitch_radius() + ADDENDUM * MODULE
+    root_radius(self) -> real = self.pitch_radius() - DEDENDUM * MODULE
+
+    // How much of a turn one tooth-and-gap occupies.
+    pitch_angle(self) -> real = 2.0 * pi / real(self.teeth)
+
+// Where a gear driven by `driver` has to sit, and at what angle, if its teeth are to fall into the
+// driver's gaps.
+//
+// **The angle is the part that is easy to get wrong and impossible to miss.** Two gears at the right
+// distance with the wrong phase are two gears whose teeth pass through each other, so this is the
+// line that decides whether the picture is of a machine or of a mistake:
+//
+//   - the centres are `r1 + r2` apart, which is what rolling without slipping means;
+//   - the driven gear turns the other way, slower by the ratio of the tooth counts;
+//   - and at the moment a tooth of the driver points along the line of centres, a *gap* of the
+//     driven gear has to point back along it — which is the `+ pi + half_gap` below.
+mesh(driver: Gear, teeth: int, bearing: real, hue: real) -> Gear
+    val r = MODULE * real(teeth) / 2.0
+    val d = driver.pitch_radius() + r
+    val ratio = real(driver.teeth) / real(teeth)
+    val half_gap = pi / real(teeth)
+
+    Gear(teeth,
+         driver.cx + d * bearing.cos(),
+         driver.cy + d * bearing.sin(),
+         -ratio * (driver.angle - bearing) + bearing + pi + half_gap,
+         hue)
+end mesh
+
+// Everything the drawing depends on. A frame is a pure function of one of these.
 struct Model
-    t: real
-    seed: real
-    hover_x: real
-    hover: bool
-    fps: real
+    angle: real
+    speed: real
+    yaw: real
+    pitch: real
+    tumbling: bool
     paused: bool
+    n1: int
+    n2: int
+    n3: int
+    hover: int
+    fps: real
 
-// The signal being plotted: three sines that do not share a period, so it never quite repeats.
-signal(x: real, m: Model) -> real
-    val a = (x * 2.4 + m.t * 0.9 + m.seed).sin()
-    val b = (x * 5.1 - m.t * 1.4 + m.seed * 2.0).sin() * 0.45
-    val c = (x * 11.3 + m.t * 2.1).sin() * 0.18
+// The three gears of the train, worked out from the model. The first is placed by hand and the other
+// two are placed by meshing, so there is nowhere for a wrong distance to hide.
+//
+// They are laid out about the origin rather than about a corner, because the origin is what the
+// assembly tumbles around.
+train(m: Model) -> (Gear, Gear, Gear)
+    val a = Gear(m.n1, -150.0, 40.0, m.angle, 0.55)
+    val b = mesh(a, m.n2, -0.16, 0.08)
+    val c = mesh(b, m.n3, -pi / 2.6, 0.33)
 
-    (a + b + c) / 1.63
-end signal
+    (a, b, c)
+end train
 
-// Where a fraction along the plot lands on screen.
-plot_x(u: real) -> real = PLOT_L + u * (PLOT_R - PLOT_L)
-plot_y(v: real) -> real = (PLOT_T + PLOT_B) / 2.0 - v * (PLOT_B - PLOT_T) / 2.0
+// ## The projection
+//
+// A rotation about the vertical axis by `yaw` and then about the horizontal one by `pitch`, viewed
+// orthographically. For a point of the plane the gears live in, that is:
+//
+//     screen_x = cos(yaw) * x
+//     screen_y = sin(pitch) * sin(yaw) * x + cos(pitch) * y
+//
+// which is linear in `x` and `y` — so it *is* a cairo matrix, exactly. The third row of the same
+// rotation gives the depth, which is what the layers are ordered by.
+//
+// `z` displaces the point along the plane's normal, and shifts its projection by a constant, so an
+// extrusion layer is this same matrix with two numbers changed.
+projection(m: Model, z: real) -> Matrix
+    val ct = m.yaw.cos()
+    val st = m.yaw.sin()
+    val cp = m.pitch.cos()
+    val sp = m.pitch.sin()
+
+    Matrix(ct, sp * st, 0.0, cp, SCREEN_X + z * st, SCREEN_Y - z * sp * ct)
+end projection
+
+// A point of the plane, at height `z` above it, in screen coordinates. The same projection as
+// `projection` writes as a matrix — spelled out here because a rim quad has corners at two different
+// heights, and a matrix can only carry one.
+project(m: Model, x: real, y: real, z: real) -> (real, real)
+    val ct = m.yaw.cos()
+    val st = m.yaw.sin()
+    val cp = m.pitch.cos()
+    val sp = m.pitch.sin()
+
+    (SCREEN_X + ct * x + z * st, SCREEN_Y + sp * st * x + cp * y - z * sp * ct)
+end project
+
+// How far into the screen a direction points — the third row of the same rotation. A surface is
+// facing the viewer when its normal's depth is negative, which is the whole of the back-face test.
+depth_of(m: Model, nx: real, ny: real, nz: real) -> real =
+    -m.pitch.cos() * m.yaw.sin() * nx + m.pitch.sin() * ny + m.pitch.cos() * m.yaw.cos() * nz
+
+// How far into the screen a layer at `z` sits. Only its sign is used — it says which face of the
+// gear is the near one.
+depth_sense(m: Model) -> real = m.pitch.cos() * m.yaw.cos()
+
+// How brightly a surface with this normal is lit, from zero to one.
+//
+// The light is fixed in *camera* space — over the viewer's left shoulder — rather than in the
+// world's, so it does not tumble with the assembly. That is what makes the rotation legible: a face
+// turning towards the light brightens as it comes round, which is the cue that says "this is a
+// solid" more than the thickness itself does.
+lambert(m: Model, nx: real, ny: real, nz: real) -> real
+    val ct = m.yaw.cos()
+    val st = m.yaw.sin()
+    val cp = m.pitch.cos()
+    val sp = m.pitch.sin()
+
+    // The normal, rotated into camera space.
+    val ex = ct * nx + st * nz
+    val ey = sp * st * nx + cp * ny - sp * ct * nz
+    val ez = depth_of(m, nx, ny, nz)
+
+    // A light from up and to the left, in front of the plane of the screen.
+    val d = ex * -0.42 + ey * -0.60 + ez * -0.68
+
+    if d < 0.0 then 0.0 else d
+end lambert
 
 // Put `text` down with its centre at `x`.
 centred(cr: Context, text: string, x: real, y: real)
@@ -90,21 +221,7 @@ right_aligned(cr: Context, text: string, x: real, y: real)
     c.show_text(text)
 end right_aligned
 
-// A rectangle whose corners are rounded by `r`, added to the current path.
-rounded_rect(cr: Context, x: real, y: real, w: real, h: real, r: real)
-    var c = cr
-    val half = pi / 2.0
-
-    c.new_sub_path()
-    c.arc(x + w - r, y + r, r, -half, 0.0)
-    c.arc(x + w - r, y + h - r, r, 0.0, half)
-    c.arc(x + r, y + h - r, r, half, pi)
-    c.arc(x + r, y + r, r, pi, 3.0 * half)
-    c.close_path()
-end rounded_rect
-
-// One value as a string with a single decimal place, since a format specifier for that is not
-// something to assume — this is arithmetic and it is exact.
+// One value with a single decimal place. Arithmetic rather than a format specifier, so it is exact.
 one_place(v: real) -> string
     val scaled = int(v * 10.0 + (if v < 0.0 then -0.5 else 0.5))
     val whole = scaled / 10
@@ -114,233 +231,403 @@ one_place(v: real) -> string
     f"$sign%s$whole%d.$tenth%d"
 end one_place
 
-// ## The frame
+// A hue in 0..1 as red, green and blue at a fixed saturation. Enough colour space for a demo, and it
+// keeps the three gears distinguishable however the tooth counts are re-cut.
+hue_rgb(h: real, v: real) -> (real, real, real)
+    val i = int(h * 6.0) % 6
+    val f = h * 6.0 - real(int(h * 6.0))
+    val p = v * 0.35
+    val q = v * (1.0 - 0.65 * f)
+    val t = v * (1.0 - 0.65 * (1.0 - f))
+
+    if i == 0 then (v, t, p)
+    elif i == 1 then (q, v, p)
+    elif i == 2 then (p, v, t)
+    elif i == 3 then (p, q, v)
+    elif i == 4 then (t, p, v)
+    else (v, p, q)
+end hue_rgb
+
+// ## Cutting a gear
 //
-// Written once, called by the window loop and by the PDF exporter alike. It never asks which it is.
+// The outline is walked tooth by tooth, and each tooth is five moves: along the floor of the gap, up
+// the flank, across the tip, down the far flank, and on to the next gap. The lands are curved
+// because they lie on the root and tip circles; the flanks are straight, which is a straight-sided
+// approximation of an involute — near enough to mesh convincingly and far simpler than the real
+// curve.
+//
+// The fractions are of one tooth pitch. A tooth is half the pitch at the pitch circle, which is what
+// lets a gear mesh with any other gear of the same module: narrower at the tip, wider at the root.
+// The outline is a *polygon* rather than a path of arcs, because the rim needs its vertices one at a
+// time: every edge of it becomes a wall, and a wall has to know which way it faces. Sampling the two
+// lands at three points each and letting the flanks be the straight lines they already are gives
+// eight points to a tooth.
+outline_points(g: Gear) -> int = g.teeth * PER_TOOTH
+
+outline_point(g: Gear, k: int) -> (real, real)
+    val fracs = [0.00, 0.10, 0.20, 0.34, 0.50, 0.66, 0.80, 0.90]
+    val tip = [false, false, false, true, true, true, false, false]
+    val n = outline_points(g)
+    val i = ((k % n) + n) % n
+    val j = i % PER_TOOTH
+    val a = g.angle + (real(i / PER_TOOTH) + fracs[j]) * g.pitch_angle()
+    val r = if tip[j] then g.tip_radius() else g.root_radius()
+
+    (g.cx + r * a.cos(), g.cy + r * a.sin())
+end outline_point
+
+// The same outline as a closed path in the plane's own coordinates, for the face.
+tooth_path(cr: Context, g: Gear)
+    var c = cr
+    val n = outline_points(g)
+    val (x0, y0) = outline_point(g, 0)
+
+    c.new_sub_path()
+    c.move_to(x0, y0)
+
+    for k in 1..<n
+        val (x, y) = outline_point(g, k)
+
+        c.line_to(x, y)
+
+    c.close_path()
+end tooth_path
+
+// The face of a gear: the toothed body under a gradient, the pitch circle, the lightening holes, the
+// hub and bore, and one tooth painted so the rotation is countable rather than merely apparent.
+gear_face(cr: Context, g: Gear, lit: bool, light: real)
+    var c = cr
+    val (r0, g0, b0) = hue_rgb(g.hue, if lit then 1.0 else 0.84)
+    val r = r0 * light
+    val gr = g0 * light
+    val b = b0 * light
+    val rp = g.pitch_radius()
+
+    tooth_path(c, g)
+
+    var body = radial_pattern(g.cx - rp * 0.45, g.cy - rp * 0.55, rp * 0.05,
+                              g.cx, g.cy, g.tip_radius() * 1.1)
+
+    body.add_color_stop_rgb(0.0, r * 1.25, gr * 1.25, b * 1.25)
+    body.add_color_stop_rgb(1.0, r * 0.62, gr * 0.62, b * 0.62)
+
+    c.set_source(body)
+    c.fill_preserve()
+    body.destroy()
+
+    c.set_source_rgba(0.0, 0.0, 0.0, 0.4)
+    c.set_line_width(1.0)
+    c.stroke()
+
+    // The pitch circle, dashed — the thing the geometry is actually about, and invisible on a real
+    // gear. Drawing it is what turns the picture into a diagram.
+    val dashes = [3.0, 6.0]
+
+    c.set_dash(dashes[0..<2], 0.0)
+    c.set_source_rgba(1.0, 1.0, 1.0, 0.20)
+    c.arc(g.cx, g.cy, rp, 0.0, 2.0 * pi)
+    c.stroke()
+    c.set_dash(dashes[0..<0], 0.0)
+
+    val holes = if g.teeth < 14 then 0 else if g.teeth < 22 then 4 else 6
+    val hole_r = g.root_radius() * 0.62
+    val hole_size = g.root_radius() * 0.16
+
+    for i in 0..<holes
+        val a = g.angle + real(i) * 2.0 * pi / real(holes)
+
+        c.arc(g.cx + hole_r * a.cos(), g.cy + hole_r * a.sin(), hole_size, 0.0, 2.0 * pi)
+        c.set_source_rgba(0.05, 0.06, 0.09, 0.9)
+        c.fill()
+
+    c.arc(g.cx, g.cy, g.root_radius() * 0.34, 0.0, 2.0 * pi)
+    c.set_source_rgb(r * 0.8, gr * 0.8, b * 0.8)
+    c.fill()
+
+    c.arc(g.cx, g.cy, g.root_radius() * 0.16, 0.0, 2.0 * pi)
+    c.set_source_rgb(0.05, 0.06, 0.09)
+    c.fill()
+
+    val p = g.pitch_angle()
+
+    c.new_path()
+    c.arc(g.cx, g.cy, g.tip_radius(), g.angle + 0.20 * p, g.angle + 0.80 * p)
+    c.arc_negative(g.cx, g.cy, g.root_radius(), g.angle + 0.80 * p, g.angle + 0.20 * p)
+    c.close_path()
+    c.set_source_rgba(1.0, 1.0, 1.0, 0.5)
+    c.fill()
+end gear_face
+
+// A gear as a solid: the outline swept through the thickness a layer at a time, darkest at the back,
+// with the face on the near end.
+//
+// **Each layer is one matrix and one fill.** Displacing the plane along its normal moves every
+// projected point by the same vector, so the layers differ only in their translation — no mesh, no
+// depth buffer, and nothing per-pixel.
+draw_gear(cr: Context, m: Model, g: Gear, lit: bool)
+    var c = cr
+    val (r, gr, b) = hue_rgb(g.hue, if lit then 0.95 else 0.78)
+    val near = if depth_sense(m) > 0.0 then -1.0 else 1.0
+    val zn = near * 0.5 * THICKNESS
+    val zf = -zn
+    val n = outline_points(g)
+
+    // ---- the rim ----
+    //
+    // One quad per edge of the outline, standing on the plane's normal. **Half of them are facing
+    // away and are never drawn** — that is the back-face test, and it is what makes the near face
+    // sit on top of a wall rather than inside a tube. Each survivor is lit by its own normal, so the
+    // wall is bright where it turns towards the light and dark where it turns away, which is the
+    // whole of the shading.
+
+    c.identity_matrix()
+
+    // Which wall is furthest away. Depth around the outline is one cycle of a sinusoid, so the
+    // visible half is the arc centred on the nearest wall and the two *ends* of that arc are the far
+    // ones. Painting outwards-in from there — the pair at distance `j`, then `j - 1`, and so on —
+    // puts every wall over the one behind it without sorting anything.
+    var nearest = 0
+    var least = 1.0e18
+
+    for k in 0..<n
+        val (ax, ay) = outline_point(g, k)
+        val d = depth_of(m, ax - g.cx, ay - g.cy, 0.0)
+
+        if d < least
+            least = d
+            nearest = k
+
+    for step in 0..<n
+        // Walk `j` down from a half turn to nothing, taking each side of `nearest` in turn.
+        val j = (n / 2) - step / 2
+        val k = if step % 2 == 0 then nearest + j else nearest - j
+        val (ax, ay) = outline_point(g, k)
+        val (bx, by) = outline_point(g, k + 1)
+        val ex = bx - ax
+        val ey = by - ay
+        val len = (ex * ex + ey * ey).sqrt()
+
+        if len > 0.0001
+            // The wall's normal is perpendicular to its edge, in the plane. Which of the two
+            // perpendiculars points outwards is decided by the winding, so it is checked against the
+            // radius rather than assumed.
+            var nx = ey / len
+            var ny = -ex / len
+            val mx = (ax + bx) / 2.0 - g.cx
+            val my = (ay + by) / 2.0 - g.cy
+
+            if nx * mx + ny * my < 0.0
+                nx = -nx
+                ny = -ny
+
+            // Facing the viewer, or not. Everything that is not is skipped entirely.
+            if depth_of(m, nx, ny, 0.0) < 0.0
+                val shade = 0.16 + 0.62 * lambert(m, nx, ny, 0.0)
+                val (p1x, p1y) = project(m, ax, ay, zf)
+                val (p2x, p2y) = project(m, bx, by, zf)
+                val (p3x, p3y) = project(m, bx, by, zn)
+                val (p4x, p4y) = project(m, ax, ay, zn)
+
+                c.move_to(p1x, p1y)
+                c.line_to(p2x, p2y)
+                c.line_to(p3x, p3y)
+                c.line_to(p4x, p4y)
+                c.close_path()
+                c.set_source_rgb(r * shade, gr * shade, b * shade)
+                c.fill()
+
+    // ---- the near face, which the rim now stands under ----
+    //
+    // Lit by the plane's own normal, so the whole gear dims as the assembly turns edge-on and
+    // brightens as it comes back — the cue that says the face is a surface and not a sticker.
+
+    val face_light = 0.45 + 0.62 * lambert(m, 0.0, 0.0, near)
+
+    c.save()
+    c.set_matrix(projection(m, zn))
+    gear_face(c, g, lit, face_light)
+    c.restore()
+end draw_gear
+
+// The point on the line of centres where two meshing gears touch. Everything about a gear train is
+// arranged so that this point stands still while the gears turn, which is worth marking.
+pitch_point(cr: Context, m: Model, a: Gear, b: Gear)
+    var c = cr
+    val near = if depth_sense(m) > 0.0 then -1.0 else 1.0
+    val t = a.pitch_radius() / (a.pitch_radius() + b.pitch_radius())
+    val x = a.cx + (b.cx - a.cx) * t
+    val y = a.cy + (b.cy - a.cy) * t
+
+    c.save()
+    c.set_matrix(projection(m, near * 0.5 * THICKNESS))
+    c.arc(x, y, 3.5, 0.0, 2.0 * pi)
+    c.set_source_rgba(1.0, 0.95, 0.75, 0.95)
+    c.fill()
+    c.arc(x, y, 9.0, 0.0, 2.0 * pi)
+    c.set_source_rgba(1.0, 0.95, 0.75, 0.4)
+    c.set_line_width(1.2)
+    c.stroke()
+    c.restore()
+end pitch_point
+
+// ## The frame
+
 draw(context_in: Context, m: Model)
     var cr = context_in
+    val (a, b, c) = train(m)
 
     // ---- background ----
 
     var sky = linear_pattern(0.0, 0.0, 0.0, HEIGHT)
 
-    sky.add_color_stop_rgb(0.0, 0.07, 0.09, 0.15)
-    sky.add_color_stop_rgb(1.0, 0.13, 0.16, 0.25)
+    sky.add_color_stop_rgb(0.0, 0.05, 0.06, 0.10)
+    sky.add_color_stop_rgb(1.0, 0.10, 0.12, 0.18)
 
     cr.set_source(sky)
     cr.paint()
     sky.destroy()
 
-    // ---- the header ----
+    // ---- the shafts, under everything so they come out from behind the gears ----
+
+    cr.save()
+    cr.set_matrix(projection(m, 0.0))
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.09)
+    cr.set_line_width(2.0)
+    cr.move_to(a.cx, a.cy)
+    cr.line_to(b.cx, b.cy)
+    cr.line_to(c.cx, c.cy)
+    cr.stroke()
+    cr.restore()
+
+    // ---- the train, back to front ----
+    //
+    // The three gears lie in one plane, so their order is decided by the depth of their centres
+    // under the same rotation the projection uses. Painting them in that order is the whole of the
+    // hidden-surface problem here, because nothing in a gear train is inside anything else.
+
+    val sp = m.pitch.sin()
+    val cs = m.pitch.cos() * m.yaw.sin()
+    val da = -cs * a.cx + sp * a.cy
+    val db = -cs * b.cx + sp * b.cy
+    val dc = -cs * c.cx + sp * c.cy
+
+    val order = if da >= db && da >= dc then
+            if db >= dc then [1, 2, 3] else [1, 3, 2]
+        elif db >= da && db >= dc then
+            if da >= dc then [2, 1, 3] else [2, 3, 1]
+        else
+            if da >= db then [3, 1, 2] else [3, 2, 1]
+
+    for i in 0..<3
+        val which = order[i]
+
+        if which == 1
+            draw_gear(cr, m, a, m.hover == 1)
+        elif which == 2
+            draw_gear(cr, m, b, m.hover == 2)
+        else
+            draw_gear(cr, m, c, m.hover == 3)
+
+    pitch_point(cr, m, a, b)
+    pitch_point(cr, m, b, c)
+
+    // ---- the words, which stay flat in screen space ----
+
+    cr.identity_matrix()
 
     cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_BOLD)
     cr.set_font_size(24.0)
     cr.set_source_rgb(0.96, 0.97, 1.0)
-    cr.move_to(PLOT_L, 52.0)
-    cr.show_text("A live chart you can print")
+    cr.move_to(48.0, 52.0)
+    cr.show_text("A gear train, tumbling")
 
     cr.select_font_face("sans", FONT_SLANT_ITALIC, FONT_WEIGHT_NORMAL)
     cr.set_font_size(12.0)
-    cr.set_source_rgba(0.96, 0.97, 1.0, 0.55)
-    cr.move_to(PLOT_L, 74.0)
-    cr.show_text("cairo draws the frame, SDL3 shows it — press S and this same drawing becomes a PDF")
-
-    // The readouts in the top right, which are the only things on the page that are about the
-    // program rather than about the data.
-    cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_NORMAL)
-    cr.set_font_size(11.0)
-    cr.set_source_rgba(0.96, 0.97, 1.0, 0.4)
-
-    val state = if m.paused then "paused" else f"${one_place(m.fps)}%s fps"
-
-    right_aligned(cr, state, PLOT_R, 52.0)
-    right_aligned(cr, f"t = ${one_place(m.t)}%s s", PLOT_R, 70.0)
-
-    // ---- the plot's gridlines ----
-
-    val dashes = [3.0, 4.0]
-
-    cr.set_dash(dashes[0..<2], 0.0)
-    cr.set_line_width(1.0)
-    cr.set_font_size(10.0)
-
-    for i in 0..<5
-        val v = 1.0 - real(i) * 0.5
-        val y = plot_y(v)
-
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.12)
-        cr.move_to(PLOT_L, y)
-        cr.line_to(PLOT_R, y)
-        cr.stroke()
-
-        cr.set_source_rgba(0.96, 0.97, 1.0, 0.35)
-        right_aligned(cr, one_place(v), PLOT_L - 8.0, y + 3.5)
-
-    cr.set_dash(dashes[0..<0], 0.0)
-
-    // ---- the curve, and the area under it ----
-    //
-    // The path is built once and used twice: filled with a gradient by `fill_preserve`, which keeps
-    // it, and then stroked. Describing it a second time would be the obvious mistake.
-
-    cr.move_to(plot_x(0.0), plot_y(signal(0.0, m)))
-
-    for i in 1..<POINTS
-        val u = real(i) / real(POINTS - 1)
-
-        cr.line_to(plot_x(u), plot_y(signal(u, m)))
-
-    cr.line_to(PLOT_R, PLOT_B)
-    cr.line_to(PLOT_L, PLOT_B)
-    cr.close_path()
-
-    var under = linear_pattern(0.0, PLOT_T, 0.0, PLOT_B)
-
-    under.add_color_stop_rgba(0.0, 0.35, 0.78, 0.98, 0.45)
-    under.add_color_stop_rgba(1.0, 0.35, 0.78, 0.98, 0.02)
-
-    cr.set_source(under)
-    cr.fill()
-    under.destroy()
-
-    cr.move_to(plot_x(0.0), plot_y(signal(0.0, m)))
-
-    for i in 1..<POINTS
-        val u = real(i) / real(POINTS - 1)
-
-        cr.line_to(plot_x(u), plot_y(signal(u, m)))
-
-    cr.set_source_rgb(0.45, 0.84, 1.0)
-    cr.set_line_width(2.0)
-    cr.set_line_join(LINE_JOIN_ROUND)
-    cr.set_line_cap(LINE_CAP_ROUND)
-    cr.stroke()
-
-    // ---- the bars ----
-
-    val labels = ["read", "write", "parse", "emit", "link", "run"]
-    val n = labels.len
-    val slot = (PLOT_R - PLOT_L) / real(n)
-    val bar = slot * 0.52
-
-    cr.set_font_size(11.0)
-
-    for i in 0..<n
-        val phase = real(i) * 0.9
-        val v = 0.55 + 0.4 * (m.t * (0.7 + real(i) * 0.13) + phase + m.seed).sin()
-        val h = v * (BAR_B - BAR_T)
-        val x = PLOT_L + real(i) * slot + (slot - bar) / 2.0
-        val y = BAR_B - h
-
-        var g = linear_pattern(0.0, y, 0.0, BAR_B)
-
-        g.add_color_stop_rgb(0.0, 0.99, 0.72, 0.36)
-        g.add_color_stop_rgb(1.0, 0.86, 0.36, 0.32)
-
-        rounded_rect(cr, x, y, bar, h, 4.0)
-        cr.set_source(g)
-        cr.fill()
-        g.destroy()
-
-        cr.set_source_rgba(0.96, 0.97, 1.0, 0.75)
-        centred(cr, labels[i], x + bar / 2.0, BAR_B + 18.0)
-
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.3)
-    cr.set_line_width(1.5)
-    cr.move_to(PLOT_L, BAR_B)
-    cr.line_to(PLOT_R, BAR_B)
-    cr.stroke()
-
-    // ---- the cursor ----
-    //
-    // Only drawn when the mouse is over the plot, and the value it reports is read out of the same
-    // `signal` the curve was drawn from rather than off the pixels — so the readout is exact and
-    // survives into the PDF.
-
-    if m.hover
-        val u = (m.hover_x - PLOT_L) / (PLOT_R - PLOT_L)
-        val v = signal(u, m)
-        val x = plot_x(u)
-        val y = plot_y(v)
-
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.28)
-        cr.set_line_width(1.0)
-        cr.move_to(x, PLOT_T - 10.0)
-        cr.line_to(x, PLOT_B)
-        cr.stroke()
-
-        cr.arc(x, y, 4.5, 0.0, 2.0 * pi)
-        cr.set_source_rgb(1.0, 1.0, 1.0)
-        cr.fill()
-
-        // A label that stays on the page: it flips to the left of the cursor near the right edge.
-        val text = one_place(v)
-
-        cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_BOLD)
-        cr.set_font_size(13.0)
-
-        val e = cr.text_extents(text)
-        val bw = e.width + 18.0
-        val bx = if x + bw + 12.0 > PLOT_R then x - bw - 12.0 else x + 12.0
-
-        rounded_rect(cr, bx, y - 15.0, bw, 26.0, 6.0)
-        cr.set_source_rgba(0.06, 0.08, 0.13, 0.92)
-        cr.fill_preserve()
-        cr.set_source_rgba(0.45, 0.84, 1.0, 0.7)
-        cr.set_line_width(1.0)
-        cr.stroke()
-
-        cr.set_source_rgb(0.96, 0.97, 1.0)
-        centred(cr, text, bx + bw / 2.0, y + 3.5)
-
-    // ---- the footer ----
+    cr.set_source_rgba(0.96, 0.97, 1.0, 0.5)
+    cr.move_to(48.0, 74.0)
+    cr.show_text("cairo cuts the teeth and projects the plane, SDL3 turns the crank and shows the frame")
 
     cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_NORMAL)
     cr.set_font_size(11.0)
-    cr.set_source_rgba(0.96, 0.97, 1.0, 0.3)
-    cr.move_to(PLOT_L, HEIGHT - 22.0)
-    cr.show_text("S  save a PDF and an SVG of this frame        space  pause        R  re-seed        Q  quit")
+    cr.set_source_rgba(0.96, 0.97, 1.0, 0.35)
 
-    right_aligned(cr, f"sh.sysl.cairo ${version()}%s + sh.sysl.sdl3", PLOT_R, HEIGHT - 22.0)
+    val state = if m.paused then "stopped" else f"${one_place(m.fps)}%s fps"
+
+    right_aligned(cr, state, WIDTH - 48.0, 52.0)
+    right_aligned(cr, f"yaw ${one_place(m.yaw * 180.0 / pi)}%s°   pitch ${one_place(m.pitch * 180.0 / pi)}%s°",
+                  WIDTH - 48.0, 70.0)
+
+    // ---- what the train does, read off the gears rather than kept beside them ----
+
+    val out_speed = real(a.teeth) / real(c.teeth)
+    val rows = [a, b, c]
+    val names = ["driver", "idler", "output"]
+
+    cr.set_font_size(12.0)
+
+    for i in 0..<3
+        val g = rows[i]
+        val y = HEIGHT - 96.0 + real(i) * 22.0
+        val (rr, gg, bb) = hue_rgb(g.hue, 0.95)
+
+        cr.arc(58.0, y - 4.0, 5.0, 0.0, 2.0 * pi)
+        cr.set_source_rgb(rr, gg, bb)
+        cr.fill()
+
+        cr.set_source_rgba(0.96, 0.97, 1.0, 0.72)
+        cr.move_to(74.0, y)
+        cr.show_text(f"${names[i]}%s — ${g.teeth}%d teeth, pitch radius ${one_place(g.pitch_radius())}%s")
+
+    cr.set_source_rgba(0.96, 0.97, 1.0, 0.5)
+    right_aligned(cr, f"the output turns ${one_place(out_speed)}%s times per turn of the driver",
+                  WIDTH - 48.0, HEIGHT - 96.0)
+    right_aligned(cr, "the idler sets the spacing and not the ratio — it cancels out",
+                  WIDTH - 48.0, HEIGHT - 74.0)
+
+    cr.set_font_size(11.0)
+    cr.set_source_rgba(0.96, 0.97, 1.0, 0.26)
+    cr.move_to(48.0, HEIGHT - 22.0)
+    cr.show_text("space  stop        [ ]  speed        T  hold the tumble        R  re-cut        Q  quit")
+
+    right_aligned(cr, f"sh.sysl.cairo ${version()}%s + sh.sysl.sdl3", WIDTH - 48.0, HEIGHT - 22.0)
 end draw
 
-// Draw the current frame onto a vector surface. This is the whole of the export: a different
-// surface, the same `draw`, and the model it is given is the one the window is showing.
-export(m: Model) -> Result[unit, string]
-    var pdf = pdf_surface("frame.pdf", WIDTH, HEIGHT)
+// Which gear the pointer is over, or 0.
+//
+// The pointer arrives in screen coordinates and the gears live in the plane, so the test is done by
+// putting the pointer *through the inverse of the projection* rather than by transforming three
+// circles forward. One matrix inversion against three, and it is exact under any tumble.
+over(m: Model, x: real, y: real) -> int
+    var inv = projection(m, 0.0)
 
-    if !pdf.ok()
-        return Err(f"the PDF surface could not be made: ${pdf.status()}%s")
+    if !inv.invert().ok()
+        return 0
 
-    pdf_set_metadata(pdf, PDF_METADATA_TITLE, "a frame of a live chart")
-    pdf_set_metadata(pdf, PDF_METADATA_CREATOR, "sh.sysl.cairo + sh.sysl.sdl3")
+    val (px, py) = inv.transform_point(x, y)
+    val (a, b, c) = train(m)
+    val da = ((px - a.cx) * (px - a.cx) + (py - a.cy) * (py - a.cy)).sqrt()
+    val db = ((px - b.cx) * (px - b.cx) + (py - b.cy) * (py - b.cy)).sqrt()
+    val dc = ((px - c.cx) * (px - c.cx) + (py - c.cy) * (py - c.cy)).sqrt()
 
-    var pcr = context(pdf)
+    if da < a.tip_radius() then 1
+    elif db < b.tip_radius() then 2
+    elif dc < c.tip_radius() then 3
+    else 0
+end over
 
-    draw(pcr, m)
-    pcr.destroy()
-    pdf.finish()
-    pdf.destroy()
+// Tooth counts that make a train worth looking at, cycled rather than drawn at random — the demo has
+// nothing to seed a generator with, and a reproducible picture is worth more here.
+recut(step: int) -> (int, int, int)
+    val sets = [[18, 30, 12], [12, 26, 18], [22, 34, 14], [16, 24, 20], [14, 32, 16]]
+    val s = sets[step % 5]
 
-    var svg = svg_surface("frame.svg", WIDTH, HEIGHT)
-
-    if !svg.ok()
-        return Err(f"the SVG surface could not be made: ${svg.status()}%s")
-
-    var scr = context(svg)
-
-    draw(scr, m)
-    scr.destroy()
-    svg.finish()
-    svg.destroy()
-
-    Ok(())
-end export
+    (s[0], s[1], s[2])
+end recut
 
 main(args: []string) -> Result[unit, string]
-    // With `--shot`, the demo draws one frame at a fixed time under SDL's dummy video driver and
-    // saves it, so the picture in the README is one the program made and can make again. Everything
-    // below this line still runs; only the display and the clock are stood in for.
+    // With `--shot`, the demo draws one frame at a fixed angle under SDL's dummy video driver and
+    // saves it. Everything below this line still runs; only the display and the clock are stood in
+    // for, and the picture is the same every time because a frame is a function of the model.
     val offscreen = args.len > 1 && args[1] == "--shot"
 
     if offscreen
@@ -349,7 +636,7 @@ main(args: []string) -> Result[unit, string]
     if !init(INIT_VIDEO)
         return Err(f"SDL would not start: ${error()}%s")
 
-    val opened = create_window("cairo + SDL3", W, H, 0)
+    val opened = create_window("cairo + SDL3 — a gear train", W, H, 0)
 
     if opened.is_none()
         return Err(f"the window would not open: ${error()}%s")
@@ -369,7 +656,7 @@ main(args: []string) -> Result[unit, string]
         return Err(f"the drawing surface could not be made: ${frame.status()}%s")
 
     // ARGB8888 is SDL's name for the same bytes cairo calls ARGB32 — B, G, R, A on a little-endian
-    // machine. Nothing is converted between the two; the texture is uploaded straight from cairo's
+    // machine. Nothing is converted between the two; the texture is uploaded straight out of cairo's
     // own storage every frame, which is what `TEXTUREACCESS_STREAMING` is for.
     val made = r.create_texture(PIXELFORMAT_ARGB8888, TEXTUREACCESS_STREAMING, i32(W), i32(H))
 
@@ -380,11 +667,15 @@ main(args: []string) -> Result[unit, string]
 
     r.set_vsync(true)
 
-    var m = Model(0.0, 0.0, 0.0, false, 60.0, false)
+    var m = Model(0.0, 0.6, 0.0, 0.0, true, false, 18, 30, 12, 0, 60.0)
+    var cut = 0
+    var clock = 0.0
     var running = true
     var last = ticks_ns()
     var frames = 0
     var fps_at = last
+    var mx = 0.0
+    var my = 0.0
 
     while running
         var pending = poll_event()
@@ -396,10 +687,9 @@ main(args: []string) -> Result[unit, string]
             if kind == EVENT_QUIT
                 running = false
             elif kind == EVENT_MOUSE_MOTION
-                val x = real(e.mouse_x())
-
-                m.hover = x >= PLOT_L && x <= PLOT_R
-                m.hover_x = x
+                mx = real(e.mouse_x())
+                my = real(e.mouse_y())
+                m.hover = over(m, mx, my)
             elif kind == EVENT_KEY_DOWN
                 val k = e.key_code()
 
@@ -408,11 +698,21 @@ main(args: []string) -> Result[unit, string]
                     running = false
                 elif k == 32
                     m.paused = !m.paused
+                elif k == 91
+                    m.speed = m.speed * 0.7
+                elif k == 93
+                    m.speed = m.speed * 1.4
+                elif k == 116
+                    m.tumbling = !m.tumbling
                 elif k == 114
-                    m.seed += 1.7
-                elif k == 115
-                    export(m)?
-                    print("wrote frame.pdf and frame.svg")
+                    cut += 1
+
+                    val (n1, n2, n3) = recut(cut)
+
+                    m.n1 = n1
+                    m.n2 = n2
+                    m.n3 = n3
+                    m.hover = over(m, mx, my)
 
             pending = poll_event()
 
@@ -424,7 +724,18 @@ main(args: []string) -> Result[unit, string]
 
         last = now
 
-        if !m.paused then m.t += dt
+        if !m.paused then m.angle += dt * m.speed
+
+        // The tumble swings rather than spins. Two sines of different periods never repeat together,
+        // so the assembly keeps presenting a face it has not shown before — and staying inside these
+        // bounds keeps the plane off exactly edge-on, where the projection is singular and there
+        // would be nothing to see anyway.
+        if m.tumbling
+            clock += dt
+
+            m.yaw = 0.85 * (clock * 0.37).sin()
+            m.pitch = 0.55 * (clock * 0.23).sin()
+            m.hover = over(m, mx, my)
 
         frames += 1
 
@@ -446,9 +757,10 @@ main(args: []string) -> Result[unit, string]
         r.present()
 
         if offscreen
-            m.t = 2.35
-            m.hover = true
-            m.hover_x = 640.0
+            m.angle = 0.42
+            m.yaw = 0.62
+            m.pitch = 0.38
+            m.hover = 2
 
             // One more pass, so the picture is of the model the README describes rather than of
             // whatever the first frame happened to be.
@@ -461,8 +773,7 @@ main(args: []string) -> Result[unit, string]
             if !frame.write_png("demo.png").ok()
                 return Err("the screenshot could not be written")
 
-            export(m)?
-            print("wrote demo.png, frame.pdf and frame.svg")
+            print("wrote demo.png")
             running = false
 
     tex.destroy()
