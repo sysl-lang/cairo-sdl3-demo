@@ -354,7 +354,7 @@ gear_face(cr: Context, g: Gear, lit: bool, light: real)
     c.arc(g.cx, g.cy, g.tip_radius(), g.angle + 0.20 * p, g.angle + 0.80 * p)
     c.arc_negative(g.cx, g.cy, g.root_radius(), g.angle + 0.80 * p, g.angle + 0.20 * p)
     c.close_path()
-    c.set_source_rgba(1.0, 1.0, 1.0, 0.5)
+    c.set_source_rgba(1.0, 1.0, 1.0, 0.22)
     c.fill()
 end gear_face
 
@@ -364,6 +364,46 @@ end gear_face
 // **Each layer is one matrix and one fill.** Displacing the plane along its normal moves every
 // projected point by the same vector, so the layers differ only in their translation — no mesh, no
 // depth buffer, and nothing per-pixel.
+// One wall of the rim: the quad standing on the outline's `k`th edge, from the far face to the near
+// one. Drawn only if it faces the viewer, and lit by its own normal.
+rim_wall(cr: Context, m: Model, g: Gear, k: int, r: real, gr: real, b: real, zn: real, zf: real)
+    var c = cr
+    val (ax, ay) = outline_point(g, k)
+    val (bx, by) = outline_point(g, k + 1)
+    val ex = bx - ax
+    val ey = by - ay
+    val len = (ex * ex + ey * ey).sqrt()
+
+    if len > 0.0001
+        // The wall's normal is perpendicular to its edge, in the plane. Which of the two
+        // perpendiculars points outwards is decided by the winding, so it is checked against the
+        // radius rather than assumed.
+        var nx = ey / len
+        var ny = -ex / len
+        val mx = (ax + bx) / 2.0 - g.cx
+        val my = (ay + by) / 2.0 - g.cy
+
+        if nx * mx + ny * my < 0.0
+            nx = -nx
+            ny = -ny
+
+        // Facing the viewer, or not. Everything that is not is skipped entirely.
+        if depth_of(m, nx, ny, 0.0) < 0.0
+            val shade = 0.16 + 0.62 * lambert(m, nx, ny, 0.0)
+            val (p1x, p1y) = project(m, ax, ay, zf)
+            val (p2x, p2y) = project(m, bx, by, zf)
+            val (p3x, p3y) = project(m, bx, by, zn)
+            val (p4x, p4y) = project(m, ax, ay, zn)
+
+            c.move_to(p1x, p1y)
+            c.line_to(p2x, p2y)
+            c.line_to(p3x, p3y)
+            c.line_to(p4x, p4y)
+            c.close_path()
+            c.set_source_rgb(r * shade, gr * shade, b * shade)
+            c.fill()
+end rim_wall
+
 draw_gear(cr: Context, m: Model, g: Gear, lit: bool)
     var c = cr
     val (r, gr, b) = hue_rgb(g.hue, if lit then 0.95 else 0.78)
@@ -397,44 +437,22 @@ draw_gear(cr: Context, m: Model, g: Gear, lit: bool)
             least = d
             nearest = k
 
-    for step in 0..<n
-        // Walk `j` down from a half turn to nothing, taking each side of `nearest` in turn.
-        val j = (n / 2) - step / 2
-        val k = if step % 2 == 0 then nearest + j else nearest - j
-        val (ax, ay) = outline_point(g, k)
-        val (bx, by) = outline_point(g, k + 1)
-        val ex = bx - ax
-        val ey = by - ay
-        val len = (ex * ex + ey * ey).sqrt()
+    // Walk `j` down from a half turn to nothing, taking the wall on each side of `nearest` in turn.
+    //
+    // **The two ends of the range are the awkward ones and are why this is not one symmetric loop.**
+    // At `j = half` the two sides name the same wall, and at `j = 0` there is only one to name, so
+    // each of those is drawn once and everything between is drawn twice — which is exactly `n` walls
+    // with none missed and none repeated. Getting that wrong leaves a hole in the rim at whichever
+    // end was skipped, and a hole in the middle of the visible band is a very visible hole.
+    val half = n / 2
 
-        if len > 0.0001
-            // The wall's normal is perpendicular to its edge, in the plane. Which of the two
-            // perpendiculars points outwards is decided by the winding, so it is checked against the
-            // radius rather than assumed.
-            var nx = ey / len
-            var ny = -ex / len
-            val mx = (ax + bx) / 2.0 - g.cx
-            val my = (ay + by) / 2.0 - g.cy
+    for i in 0..<(half + 1)
+        val j = half - i
 
-            if nx * mx + ny * my < 0.0
-                nx = -nx
-                ny = -ny
+        rim_wall(c, m, g, nearest + j, r, gr, b, zn, zf)
 
-            // Facing the viewer, or not. Everything that is not is skipped entirely.
-            if depth_of(m, nx, ny, 0.0) < 0.0
-                val shade = 0.16 + 0.62 * lambert(m, nx, ny, 0.0)
-                val (p1x, p1y) = project(m, ax, ay, zf)
-                val (p2x, p2y) = project(m, bx, by, zf)
-                val (p3x, p3y) = project(m, bx, by, zn)
-                val (p4x, p4y) = project(m, ax, ay, zn)
-
-                c.move_to(p1x, p1y)
-                c.line_to(p2x, p2y)
-                c.line_to(p3x, p3y)
-                c.line_to(p4x, p4y)
-                c.close_path()
-                c.set_source_rgb(r * shade, gr * shade, b * shade)
-                c.fill()
+        if j > 0 && j < half
+            rim_wall(c, m, g, nearest - j, r, gr, b, zn, zf)
 
     // ---- the near face, which the rim now stands under ----
     //
