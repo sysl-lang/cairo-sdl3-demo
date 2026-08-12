@@ -121,8 +121,13 @@ Cost
 
 About 40% of one core at 60 fps on an M-series Mac — roughly 400 shaded rim quads plus three faces
 per frame, all software-rasterized by cairo. **RSS holds steady**, drifting a few MB either way
-around 100 MB rather than climbing: every cairo object here is destroyed by hand, and a missing
-`destroy` in a frame loop shows up as a one-way climb within seconds.
+around 100 MB rather than climbing.
+
+That used to be a thing to watch: every cairo object was released by hand, and one missed `destroy`
+in a frame loop showed up as a one-way climb within seconds. Since cairo 0.2.0 there is no `destroy`
+to miss — each object is a `&T` with an `impl Drop`, so a surface made inside the loop goes when the
+iteration ends. The steady RSS is now a property of the binding rather than of this program's
+discipline.
 
 `--shot`
 --------

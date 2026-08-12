@@ -273,7 +273,7 @@ Some small things
 
 Text is placed by measuring it, which is the only way that does not assume a font.
 
-    centred(cr: Context, text: string, x: real, y: real)
+    centred(cr: &Context, text: string, x: real, y: real)
         var c = cr
         val e = c.text_extents(text)
 
@@ -281,7 +281,7 @@ Text is placed by measuring it, which is the only way that does not assume a fon
         c.show_text(text)
     end centred
 
-    right_aligned(cr: Context, text: string, x: real, y: real)
+    right_aligned(cr: &Context, text: string, x: real, y: real)
         var c = cr
         val e = c.text_extents(text)
 
@@ -355,7 +355,7 @@ straight and need none. Eight points to a tooth.
 The index wraps, so asking for point $k+1$ at the end of the ring is asking for point $0$, and no
 caller has to think about it.
 
-    tooth_path(cr: Context, g: Gear)
+    tooth_path(cr: &Context, g: Gear)
         var c = cr
         val n = outline_points(g)
         val (x0, y0) = outline_point(g, 0)
@@ -412,7 +412,7 @@ this shows through.
 That is the difference between a plate with holes in it and a plate with circles painted on it, and
 it is one call to `set_fill_rule`.
 
-    gear_face(cr: Context, g: Gear, lit: bool, light: real)
+    gear_face(cr: &Context, g: Gear, lit: bool, light: real)
         var c = cr
         val (r0, g0, b0) = hue_rgb(g.hue, if lit then 1.0 else 0.84)
         val r = r0 * light
@@ -434,11 +434,10 @@ it is one call to `set_fill_rule`.
         body.add_color_stop_rgb(0.0, r * 1.25, gr * 1.25, b * 1.25)
         body.add_color_stop_rgb(1.0, r * 0.62, gr * 0.62, b * 0.62)
 
-        c.set_fill_rule(FILL_RULE_EVEN_ODD)
+        c.set_fill_rule(FillRule.EvenOdd)
         c.set_source(body)
         c.fill_preserve()
-        c.set_fill_rule(FILL_RULE_WINDING)
-        body.destroy()
+        c.set_fill_rule(FillRule.Winding)
 
 Stroking the same compound path outlines the teeth and every hole at once — the edge where the face
 meets the walls, in one call, because the path is still there after `fill_preserve`.
@@ -468,10 +467,10 @@ stay open or the shaft has nowhere to go. Two circles under the even-odd rule ag
         c.arc(g.cx, g.cy, g.root_radius() * 0.34, 0.0, 2.0 * pi)
         c.new_sub_path()
         c.arc(bx, by, br, 0.0, 2.0 * pi)
-        c.set_fill_rule(FILL_RULE_EVEN_ODD)
+        c.set_fill_rule(FillRule.EvenOdd)
         c.set_source_rgba(r * 1.1, gr * 1.1, b * 1.1, 0.55)
         c.fill()
-        c.set_fill_rule(FILL_RULE_WINDING)
+        c.set_fill_rule(FillRule.Winding)
 
 One tooth painted, so the rotation is countable rather than merely apparent. `arc` outwards along the
 tip and `arc_negative` back along the root closes the shape of a single tooth.
@@ -501,7 +500,7 @@ which one points outwards depends on the winding, so it is checked against the r
 assumed. A wall is drawn only when it faces the viewer, $d(\mathbf{n}) < 0$. Exactly half of them
 survive, and that is what lets the near face sit *on* a wall rather than inside a tube.
 
-    rim_wall(cr: Context, m: Model, g: Gear, k: int, r: real, gr: real, b: real, zn: real, zf: real)
+    rim_wall(cr: &Context, m: Model, g: Gear, k: int, r: real, gr: real, b: real, zn: real, zf: real)
         var c = cr
         val (ax, ay) = outline_point(g, k)
         val (bx, by) = outline_point(g, k + 1)
@@ -543,7 +542,7 @@ A circle is convex, so its visible inner walls never overlap each other and none
 trouble below arises here. They are darker than the rim because less light reaches down a hole — the
 cheapest approximation of ambient occlusion there is, and at this size it is enough.
 
-    hole_wall(cr: Context, m: Model, hx: real, hy: real, rh: real,
+    hole_wall(cr: &Context, m: Model, hx: real, hy: real, rh: real,
               r: real, gr: real, b: real, zn: real, zf: real)
         var c = cr
         val segs = 18
@@ -606,7 +605,7 @@ $1$, so the wall at $j = 0$ — the *nearest* one, in the middle of the visible 
 at all, while $j = n/2$ was drawn twice. The result was one tooth per gear with a hole straight
 through its rim, travelling round the gear as it turned.
 
-    draw_gear(cr: Context, m: Model, g: Gear, lit: bool)
+    draw_gear(cr: &Context, m: Model, g: Gear, lit: bool)
         var c = cr
         val (r, gr, b) = hue_rgb(g.hue, if lit then 0.95 else 0.78)
         val near = if depth_sense(m) > 0.0 then -1.0 else 1.0
@@ -660,7 +659,7 @@ The **pitch point** is where two meshing gears touch, at the place on the line o
 divides it in the ratio of the pitch radii. The whole of gear design is arranged so that this point
 stands still while everything turns, which is worth marking.
 
-    pitch_point(cr: Context, m: Model, a: Gear, b: Gear)
+    pitch_point(cr: &Context, m: Model, a: Gear, b: Gear)
         var c = cr
         val near = if depth_sense(m) > 0.0 then -1.0 else 1.0
         val t = a.pitch_radius() / (a.pitch_radius() + b.pitch_radius())
@@ -683,7 +682,7 @@ stands still while everything turns, which is worth marking.
 The frame
 ---------
 
-    draw(context_in: Context, m: Model)
+    draw(context_in: &Context, m: Model)
         var cr = context_in
         val (a, b, c) = train(m)
 
@@ -694,7 +693,6 @@ The frame
 
         cr.set_source(sky)
         cr.paint()
-        sky.destroy()
 
 The shafts go under everything, so they come out from behind the gears. They are in the plane, so
 they get the plain projection with no height.
@@ -742,19 +740,19 @@ The words stay flat in screen space, so the transform is thrown away first.
 
         cr.identity_matrix()
 
-        cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_BOLD)
+        cr.select_font_face("sans", FontSlant.Normal, FontWeight.Bold)
         cr.set_font_size(24.0)
         cr.set_source_rgb(0.96, 0.97, 1.0)
         cr.move_to(48.0, 52.0)
         cr.show_text("A gear train, tumbling")
 
-        cr.select_font_face("sans", FONT_SLANT_ITALIC, FONT_WEIGHT_NORMAL)
+        cr.select_font_face("sans", FontSlant.Italic, FontWeight.Normal)
         cr.set_font_size(12.0)
         cr.set_source_rgba(0.96, 0.97, 1.0, 0.5)
         cr.move_to(48.0, 74.0)
         cr.show_text("cairo cuts the teeth and projects the plane, SDL3 turns the crank and shows the frame")
 
-        cr.select_font_face("sans", FONT_SLANT_NORMAL, FONT_WEIGHT_NORMAL)
+        cr.select_font_face("sans", FontSlant.Normal, FontWeight.Normal)
         cr.set_font_size(11.0)
         cr.set_source_rgba(0.96, 0.97, 1.0, 0.35)
 
@@ -877,12 +875,12 @@ every time because a frame is a pure function of one `Model`.
 
 The one buffer both libraries touch. Cairo owns it; SDL only ever reads it.
 
-        var frame = image_surface(FORMAT_ARGB32, W, H)
+        var frame = image_surface(Format.Argb32, W, H)
 
         if !frame.ok()
             return Err(f"the drawing surface could not be made: ${frame.status()}%s")
 
-`PIXELFORMAT_ARGB8888` is SDL's name for the same bytes cairo calls `FORMAT_ARGB32` — B, G, R, A on a
+`PIXELFORMAT_ARGB8888` is SDL's name for the same bytes cairo calls `Format.Argb32` — B, G, R, A on a
 little-endian machine. Nothing is converted between the two; the texture is uploaded straight out of
 cairo's own storage every frame, which is what `TEXTUREACCESS_STREAMING` exists for.
 
@@ -980,7 +978,6 @@ and shows.
             var cr = context(frame)
 
             draw(cr, m)
-            cr.destroy()
             frame.flush()
 
             tex.update(as_ptr(frame.data()), i32(frame.stride()))
@@ -997,7 +994,6 @@ and shows.
                 var shot = context(frame)
 
                 draw(shot, m)
-                shot.destroy()
                 frame.flush()
 
                 if !frame.write_png("demo.png").ok()
@@ -1006,10 +1002,6 @@ and shows.
                 print("wrote demo.png")
                 running = false
 
-        tex.destroy()
-        r.destroy()
-        win.destroy()
-        frame.destroy()
         quit()
         Ok(())
     end main
