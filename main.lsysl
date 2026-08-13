@@ -25,6 +25,7 @@ and it does not, for a reason worth the rest of this page.
 
     import sh.sysl.cairo.*
     import sh.sysl.sdl3.*
+    import sh.sysl.sdl3.c.INIT_VIDEO
     import sysl.math.{Float, pi}
     import sysl.slices.as_ptr
 
@@ -880,11 +881,11 @@ The one buffer both libraries touch. Cairo owns it; SDL only ever reads it.
         if !frame.ok()
             return Err(f"the drawing surface could not be made: ${frame.status()}%s")
 
-`PIXELFORMAT_ARGB8888` is SDL's name for the same bytes cairo calls `Format.Argb32` — B, G, R, A on a
+`PixelFormat.Argb8888` is SDL's name for the same bytes cairo calls `Format.Argb32` — B, G, R, A on a
 little-endian machine. Nothing is converted between the two; the texture is uploaded straight out of
-cairo's own storage every frame, which is what `TEXTUREACCESS_STREAMING` exists for.
+cairo's own storage every frame, which is what `TextureAccess.Streaming` exists for.
 
-        val made = r.create_texture(PIXELFORMAT_ARGB8888, TEXTUREACCESS_STREAMING, i32(W), i32(H))
+        val made = r.create_texture(PixelFormat.Argb8888, TextureAccess.Streaming, i32(W), i32(H))
 
         if made.is_none()
             return Err(f"the texture could not be made: ${error()}%s")
@@ -908,15 +909,15 @@ cairo's own storage every frame, which is what `TEXTUREACCESS_STREAMING` exists 
 
             while pending.is_some()
                 val e = pending.unwrap()
-                val kind = e.kind
+                val kind = e.kind()
 
-                if kind == EVENT_QUIT
+                if kind == EventKind.Quit
                     running = false
-                elif kind == EVENT_MOUSE_MOTION
+                elif kind == EventKind.MouseMotion
                     mx = real(e.mouse_x())
                     my = real(e.mouse_y())
                     m.hover = over(m, mx, my)
-                elif kind == EVENT_KEY_DOWN
+                elif kind == EventKind.KeyDown
                     val k = e.key_code()
 
 SDL spells an ordinary key as its own character, so these are ASCII.

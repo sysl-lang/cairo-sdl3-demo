@@ -8,7 +8,9 @@ A gear train tumbling in space — [**cairo**](https://github.com/sysl-lang/cair
 
 ```
 brew install cairo sdl3
-sysl run . --link-path /opt/homebrew/lib --include-path cairo=/opt/homebrew/include/cairo
+sysl run . --link-path /opt/homebrew/lib \
+           --include-path cairo=/opt/homebrew/include/cairo \
+           --include-path sdl3=/opt/homebrew/include
 ```
 
 | key | what it does |
