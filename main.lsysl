@@ -25,7 +25,6 @@ and it does not, for a reason worth the rest of this page.
 
     import sh.sysl.cairo.*
     import sh.sysl.sdl3.*
-    import sh.sysl.sdl3.c.INIT_VIDEO
     import sysl.math.{Float, pi}
     import sysl.slices.as_ptr
 
