@@ -8,11 +8,12 @@
 package {
   name    = "cairo-sdl3-demo"
   version = "0.4.1"
+  sysl    = "0.6.0"
 }
 
 dependencies {
-  cairo { git = "github.com/sysl-lang/cairo", version = "0.3.2" }
-  sdl3 { git = "github.com/sysl-lang/sdl3", version = "0.3.6" }
+  cairo { git = "github.com/sysl-lang/cairo", version = "0.3.4" }
+  sdl3 { git = "github.com/sysl-lang/sdl3", version = "0.3.11" }
 }
 
 requires {
